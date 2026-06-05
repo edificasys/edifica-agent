@@ -886,3 +886,12 @@ setInterval(async () => {
 // ── Arrancar ──────────────────────────────────────────────────────────
 console.log('Iniciando worker de WhatsApp...')
 connectToWhatsApp()
+
+// Ping interno cada 13 min
+cron.schedule('*/13 * * * *', () => {
+  http.get('http://localhost:' + (process.env.PORT || 3000), (res) => {
+    console.log('[Ping] Toque interno enviado. Status:', res.statusCode)
+  }).on('error', (err) => {
+    console.error('[Ping Error]', err.message)
+  })
+})
