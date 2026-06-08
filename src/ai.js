@@ -10,8 +10,18 @@ const groq = new Groq({ apiKey: process.env.GROQ_API_KEY })
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY)
 
 // ── Detección de tipo de agente (sin API call extra) ─────────────
-function detectAgentType(text) {
+function detectAgentType(text, settings) {
   const t = (text || '').toLowerCase()
+
+  if (settings?.custom_agents && Array.isArray(settings.custom_agents)) {
+    for (const ca of settings.custom_agents) {
+      if (ca.keywords && Array.isArray(ca.keywords)) {
+        if (ca.keywords.some(kw => t.includes(kw.toLowerCase()))) {
+          return ca.name
+        }
+      }
+    }
+  }
 
   // Redirección — máxima prioridad
   if (/hablar con (un |una )?(persona|asesor|humano|alguien|vendedor|representante)|quiero (ser |)atendid|me comunic[ae]|derivame|pasame|un asesor|necesito (que me llamen|hablar con alguien)|llamarme|hablen conmigo|quiero contactarme/.test(t))
@@ -54,7 +64,12 @@ const AGENT_PROMPTS = {
 async function buildSystemPrompt(agentType, settings) {
   // Use DB agent prompt override if the admin customized it, otherwise use defaults
   const agentOverride = settings.agent_prompts?.[agentType]
-  const base = agentOverride || AGENT_PROMPTS[agentType] || AGENT_PROMPTS.generalista
+  let base = agentOverride || AGENT_PROMPTS[agentType] || AGENT_PROMPTS.generalista
+
+  if (settings.custom_agents && Array.isArray(settings.custom_agents)) {
+    const ca = settings.custom_agents.find(a => a.name === agentType)
+    if (ca) base = ca.prompt || ''
+  }
 
   const businessCtx = `\nNegocio: ${settings.business_description || 'EDIFICA Obras y Servicios, Córdoba'}
 📍 Showroom: Pehuajo 2721 | ⏰ L-V 9-18hs | 📧 contactanos@edifica.com | 📱 +54 9 3518 00-7584`
@@ -175,7 +190,7 @@ export async function getAIReply({ text, hasImage, imageBuffer, hasAudio, audioB
   }
 
   // Detectar tipo de agente
-  const agentType = agentTypeOverride || detectAgentType(text)
+  const agentType = agentTypeOverride || detectAgentType(text, settings)
   const isHandoff = agentType === 'redireccion'
 
   // Imagen del cliente → Gemini analiza y describe

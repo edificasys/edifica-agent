@@ -15,6 +15,7 @@ async function runMigrations() {
         ADD COLUMN IF NOT EXISTS agent_prompts    JSONB         DEFAULT '{}',
         ADD COLUMN IF NOT EXISTS faqs             JSONB         DEFAULT '[]',
         ADD COLUMN IF NOT EXISTS agent_active     JSONB         DEFAULT '{}',
+        ADD COLUMN IF NOT EXISTS custom_agents    JSONB         DEFAULT '[]',
         ADD COLUMN IF NOT EXISTS business_name    VARCHAR(100),
         ADD COLUMN IF NOT EXISTS business_logo    TEXT
     `)
@@ -168,7 +169,7 @@ export const db = {
       admin_phone, redirect_phone,
       allowed_phones, blacklist_phones, blacklist_all,
       agent_prompts, faqs, agent_active,
-      business_name, business_logo,
+      business_name, business_logo, advisors, business_hours, custom_agents
     } = data
     await pool.query(`
       UPDATE ai_settings SET
@@ -187,6 +188,9 @@ export const db = {
         agent_active         = COALESCE($13, agent_active),
         business_name        = COALESCE($14, business_name),
         business_logo        = COALESCE($15, business_logo),
+        advisors             = COALESCE($16, advisors),
+        business_hours       = COALESCE($17, business_hours),
+        custom_agents        = COALESCE($18, custom_agents),
         updated_at           = NOW()
       WHERE id = (SELECT id FROM ai_settings LIMIT 1)
     `, [
@@ -200,6 +204,9 @@ export const db = {
       agent_active && typeof agent_active === 'object' ? JSON.stringify(agent_active) : null,
       business_name || null,
       business_logo !== undefined ? (business_logo || null) : undefined,
+      Array.isArray(advisors) ? JSON.stringify(advisors) : null,
+      business_hours && typeof business_hours === 'object' ? JSON.stringify(business_hours) : null,
+      Array.isArray(custom_agents) ? JSON.stringify(custom_agents) : null,
     ])
     return this.getAISettings()
   },

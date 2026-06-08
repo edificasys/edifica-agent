@@ -50,6 +50,12 @@ async function connectToWhatsApp() {
     version,
     auth: state,
     printQRInTerminal: false,
+    markOnlineOnConnect: false,
+    syncFullHistory: false,
+    generateHighQualityLinkPreview: true,
+    getMessage: async (key) => {
+      return { conversation: 'Mensaje desencriptado' }
+    },
     logger: {
       level: 'silent', log: () => {}, info: () => {}, warn: () => {},
       error: console.error, trace: () => {}, debug: () => {},
@@ -159,8 +165,12 @@ async function connectToWhatsApp() {
       let audioBuffer = null
 
       try {
-        if (hasImage) imageBuffer = await downloadMediaMessage(msg, 'buffer', {})
-        if (hasAudio) audioBuffer = await downloadMediaMessage(msg, 'buffer', {})
+        if (hasImage) {
+          try { imageBuffer = await downloadMediaMessage(msg, 'buffer', {}) } catch (e) { console.error('[IMG] Error descarga:', e.message) }
+        }
+        if (hasAudio) {
+          try { audioBuffer = await downloadMediaMessage(msg, 'buffer', {}) } catch (e) { console.error('[AUDIO] Error descarga:', e.message) }
+        }
 
         const contact = await db.upsertContact(identifier, msg.pushName || '')
 
@@ -230,12 +240,14 @@ async function connectToWhatsApp() {
             `📋 *Resumen de la consulta:*\n${summary}${imgLine}\n` +
             `⏰ ${new Date().toLocaleString('es-AR', { timeZone: 'America/Argentina/Buenos_Aires' })}`
           try {
-            await sock.sendMessage(`${REDIRECT}@s.whatsapp.net`, { text: adminMsg })
+            const targetAdvisorPhone = result.handoff_target || REDIRECT
+            const validPhone = String(targetAdvisorPhone).replace(/[^0-9]/g, '') || REDIRECT
+            await sock.sendMessage(`${validPhone}@s.whatsapp.net`, { text: adminMsg })
             // Si el cliente mandó imagen, reenviarla al asesor también
             if (imageBuffer && imageDescription) {
-              await sock.sendMessage(`${REDIRECT}@s.whatsapp.net`, { image: imageBuffer, caption: `📎 Imagen enviada por ${clientName}` })
+              await sock.sendMessage(`${validPhone}@s.whatsapp.net`, { image: imageBuffer, caption: `📎 Imagen enviada por ${clientName}` })
             }
-            console.log(`[REDIR] Resumen enviado al asesor ${REDIRECT}`)
+            console.log(`[REDIR] Resumen enviado al asesor ${validPhone}`)
           } catch (e) {
             console.error('[REDIR] Error enviando resumen al asesor:', e.message)
           }
@@ -280,7 +292,8 @@ cron.schedule('*/5 * * * *', async () => {
       const history = await db.getRecentMessages(conv.conversation_id, 10)
       const result  = await getAIReply({ text: '', hasImage: false, imageBuffer: null, hasAudio: false, audioBuffer: null, history, clientName: conv.name || conv.phone, agentTypeOverride: 'recontacto' })
       if (result.reply) {
-        await activeSock.sendMessage(`${conv.phone}@s.whatsapp.net`, { text: result.reply })
+        const targetJid = conv.phone.length >= 15 ? `${conv.phone}@lid` : `${conv.phone}@s.whatsapp.net`
+        await activeSock.sendMessage(targetJid, { text: result.reply })
         await db.saveMessage(conv.conversation_id, 'ai', result.reply, 'recontacto')
         await db.setRecontactSent(conv.conversation_id)
         await createAndPushNotif('recontacto', 'Recontacto enviado', `Seguimiento automático a ${conv.name || conv.phone}`, { convId: conv.conversation_id, phone: conv.phone, name: conv.name })
@@ -713,7 +726,8 @@ Respondé en español rioplatense, mensajes cortos y claros. Sé amigable pero d
       if (!activeSock || connectionStatus !== 'connected') return json(res, { error: 'WhatsApp no conectado' }, 503)
       const conv = await db.getConversationWithContact(convId)
       if (!conv) return json(res, { error: 'Conversación no encontrada' }, 404)
-      await activeSock.sendMessage(`${conv.phone}@s.whatsapp.net`, { text: message.trim() })
+      const targetJid = conv.phone.length >= 15 ? `${conv.phone}@lid` : `${conv.phone}@s.whatsapp.net`
+      await activeSock.sendMessage(targetJid, { text: message.trim() })
       await db.saveMessage(convId, 'human', message.trim(), 'human')
       await db.logActivity(authUser.id, authUser.username, 'mensaje_manual', { convId, phone: conv.phone, preview: message.substring(0, 50) })
       await createAndPushNotif('human_msg', 'Mensaje manual enviado', `${authUser.name || authUser.username} → ${conv.name || conv.phone}: "${message.substring(0, 50)}"`, { convId, phone: conv.phone })
