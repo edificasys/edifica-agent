@@ -16,6 +16,7 @@ async function runMigrations() {
         ADD COLUMN IF NOT EXISTS faqs             JSONB         DEFAULT '[]',
         ADD COLUMN IF NOT EXISTS agent_active     JSONB         DEFAULT '{}',
         ADD COLUMN IF NOT EXISTS custom_agents    JSONB         DEFAULT '[]',
+        ADD COLUMN IF NOT EXISTS agent_overrides  JSONB         DEFAULT '{}',
         ADD COLUMN IF NOT EXISTS business_name    VARCHAR(100),
         ADD COLUMN IF NOT EXISTS business_logo    TEXT
     `)
@@ -168,7 +169,7 @@ export const db = {
       personality_prompt, business_description, welcome_message, goals, restrictions,
       admin_phone, redirect_phone,
       allowed_phones, blacklist_phones, blacklist_all,
-      agent_prompts, faqs, agent_active,
+      agent_prompts, faqs, agent_active, agent_overrides,
       business_name, business_logo, advisors, business_hours, custom_agents
     } = data
     await pool.query(`
@@ -191,6 +192,7 @@ export const db = {
         advisors             = COALESCE($16, advisors),
         business_hours       = COALESCE($17, business_hours),
         custom_agents        = COALESCE($18, custom_agents),
+        agent_overrides      = COALESCE($19, agent_overrides),
         updated_at           = NOW()
       WHERE id = (SELECT id FROM ai_settings LIMIT 1)
     `, [
@@ -207,6 +209,7 @@ export const db = {
       Array.isArray(advisors) ? JSON.stringify(advisors) : null,
       business_hours && typeof business_hours === 'object' ? JSON.stringify(business_hours) : null,
       Array.isArray(custom_agents) ? JSON.stringify(custom_agents) : null,
+      agent_overrides && typeof agent_overrides === 'object' ? JSON.stringify(agent_overrides) : null,
     ])
     return this.getAISettings()
   },
