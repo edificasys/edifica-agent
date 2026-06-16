@@ -191,6 +191,14 @@ async function connectToWhatsApp() {
         // Imágenes ya enviadas en esta conversación
         const imagesSent = await db.getImagesSent(contact.conversation_id).catch(() => ({}))
 
+        const convInfo = await db.getConversationWithContact(contact.conversation_id)
+        if (convInfo?.bot_paused) {
+          const saved = text || (hasImage ? '[imagen]' : hasAudio ? '[audio]' : '[mensaje]')
+          await db.saveMessage(contact.conversation_id, 'client', saved, 'cliente')
+          await createAndPushNotif('conv_active', 'Mensaje (bot en pausa)', `${msg.pushName || identifier}: "${saved.substring(0, 60)}"`, { convId: contact.conversation_id, phone: identifier, name: msg.pushName || '' })
+          continue
+        }
+
         const result = await getAIReply({ text, hasImage, imageBuffer, hasAudio, audioBuffer, audioMime, history, clientName: msg.pushName || identifier, imagesSent })
 
         const { reply, agentType, isHandoff, summary, imageInfo, imageDescription } = result
@@ -736,6 +744,17 @@ Respondé en español rioplatense, mensajes cortos y claros. Sé amigable pero d
       await db.saveMessage(convId, 'human', message.trim(), 'human')
       await db.logActivity(authUser.id, authUser.username, 'mensaje_manual', { convId, phone: conv.phone, preview: message.substring(0, 50) })
       await createAndPushNotif('human_msg', 'Mensaje manual enviado', `${authUser.name || authUser.username} → ${conv.name || conv.phone}: "${message.substring(0, 50)}"`, { convId, phone: conv.phone })
+      return json(res, { ok: true })
+    } catch (err) { return json(res, { error: err.message }, 500) }
+  }
+
+  // POST /api/conversations/:id/pause
+  const convPauseMatch = url.match(/^\/api\/conversations\/(\d+)\/pause$/)
+  if (convPauseMatch && req.method === 'POST') {
+    try {
+      const { paused } = await parseBody(req)
+      const convId = parseInt(convPauseMatch[1])
+      await db.setBotPaused(convId, !!paused)
       return json(res, { ok: true })
     } catch (err) { return json(res, { error: err.message }, 500) }
   }

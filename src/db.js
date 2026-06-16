@@ -60,7 +60,8 @@ async function runMigrations() {
         ADD COLUMN IF NOT EXISTS recontact_at   TIMESTAMPTZ,
         ADD COLUMN IF NOT EXISTS recontact_sent BOOLEAN DEFAULT false,
         ADD COLUMN IF NOT EXISTS recontact_min  INTEGER DEFAULT 60,
-        ADD COLUMN IF NOT EXISTS images_sent    JSONB   DEFAULT '{}'
+        ADD COLUMN IF NOT EXISTS images_sent    JSONB   DEFAULT '{}',
+        ADD COLUMN IF NOT EXISTS bot_paused     BOOLEAN DEFAULT false
     `)
     await pool.query(`
       ALTER TABLE messages DROP CONSTRAINT IF EXISTS messages_sender_check
@@ -298,6 +299,7 @@ export const db = {
       SELECT
         conv.id,
         conv.last_message_at,
+        conv.bot_paused,
         c.phone,
         c.name,
         c.first_contact_at,
@@ -510,7 +512,7 @@ export const db = {
   // ── Conversation helpers ──────────────────────────────────────────
   async getConversationWithContact(convId) {
     const { rows } = await pool.query(`
-      SELECT conv.id, conv.last_message_at, conv.recontact_min,
+      SELECT conv.id, conv.last_message_at, conv.recontact_min, conv.bot_paused,
              c.phone, c.name
       FROM conversations conv
       JOIN contacts c ON c.id = conv.contact_id
@@ -540,6 +542,10 @@ export const db = {
 
   async resetRecontact(convId) {
     await pool.query(`UPDATE conversations SET recontact_sent = false WHERE id = $1`, [convId])
+  },
+
+  async setBotPaused(convId, paused) {
+    await pool.query(`UPDATE conversations SET bot_paused = $2 WHERE id = $1`, [convId, paused])
   },
 
   // ── Images sent tracking ──────────────────────────────────────────
