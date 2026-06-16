@@ -5,6 +5,7 @@ import QRCode from 'qrcode'
 import cron from 'node-cron'
 import http from 'http'
 import dotenv from 'dotenv'
+import fs from 'fs'
 import Groq from 'groq-sdk'
 import { db } from './db.js'
 import { getAIReply } from './ai.js'
@@ -87,7 +88,11 @@ async function connectToWhatsApp() {
         setTimeout(connectToWhatsApp, 5000)
       } else {
         await sendAdminAlert('Sesión cerrada de WhatsApp.\nEscaneá el QR de nuevo desde el dashboard.')
-        console.log('Sesión cerrada. Necesita nuevo QR.')
+        console.log('Sesión cerrada. Necesita nuevo QR. Limpiando sesión y generando nuevo QR...')
+        if (fs.existsSync('./auth_info')) {
+          fs.rmSync('./auth_info', { recursive: true, force: true })
+        }
+        setTimeout(connectToWhatsApp, 5000)
       }
     }
 
