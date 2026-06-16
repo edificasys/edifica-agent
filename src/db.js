@@ -63,6 +63,9 @@ async function runMigrations() {
         ADD COLUMN IF NOT EXISTS images_sent    JSONB   DEFAULT '{}'
     `)
     await pool.query(`
+      ALTER TABLE messages DROP CONSTRAINT IF EXISTS messages_sender_check
+    `)
+    await pool.query(`
       CREATE TABLE IF NOT EXISTS appointments (
         id          SERIAL PRIMARY KEY,
         contact_id  INTEGER REFERENCES contacts(id) ON DELETE SET NULL,
