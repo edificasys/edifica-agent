@@ -191,14 +191,6 @@ async function connectToWhatsApp() {
         // Imágenes ya enviadas en esta conversación
         const imagesSent = await db.getImagesSent(contact.conversation_id).catch(() => ({}))
 
-        const convInfo = await db.getConversationWithContact(contact.conversation_id)
-        if (convInfo?.bot_paused) {
-          const saved = text || (hasImage ? '[imagen]' : hasAudio ? '[audio]' : '[mensaje]')
-          await db.saveMessage(contact.conversation_id, 'client', saved, 'cliente')
-          await createAndPushNotif('conv_active', 'Mensaje (bot en pausa)', `${msg.pushName || identifier}: "${saved.substring(0, 60)}"`, { convId: contact.conversation_id, phone: identifier, name: msg.pushName || '' })
-          continue
-        }
-
         const result = await getAIReply({ text, hasImage, imageBuffer, hasAudio, audioBuffer, audioMime, history, clientName: msg.pushName || identifier, imagesSent })
 
         const { reply, agentType, isHandoff, summary, imageInfo, imageDescription } = result
@@ -304,9 +296,8 @@ cron.schedule('*/5 * * * *', async () => {
     for (const conv of convs) {
       const history = await db.getRecentMessages(conv.conversation_id, 10)
       const result  = await getAIReply({ text: '', hasImage: false, imageBuffer: null, hasAudio: false, audioBuffer: null, history, clientName: conv.name || conv.phone, agentTypeOverride: 'recontacto' })
-      if (result.reply && !result.isError) {
-        const isLid = conv.phone.length >= 14 && !conv.phone.startsWith('549');
-        const targetJid = isLid ? `${conv.phone}@lid` : `${conv.phone}@s.whatsapp.net`
+      if (result.reply) {
+        const targetJid = conv.phone.length >= 15 ? `${conv.phone}@lid` : `${conv.phone}@s.whatsapp.net`
         await activeSock.sendMessage(targetJid, { text: result.reply })
         await db.saveMessage(conv.conversation_id, 'ai', result.reply, 'recontacto')
         await db.setRecontactSent(conv.conversation_id)
@@ -421,24 +412,12 @@ Respondé en español rioplatense, mensajes cortos y claros. Sé amigable pero d
         ...history.slice(-6).map(m => ({ role: m.role, content: m.content || m.text || '' })),
         { role: 'user', content: message }
       ]
-      let r;
-      try {
-        r = await groq.chat.completions.create({
-          model: 'llama-3.3-70b-versatile',
-          messages,
-          max_tokens: 250,
-          temperature: 0.5,
-        })
-      } catch (e) {
-        if (e.status === 429) {
-          r = await groq.chat.completions.create({
-            model: 'llama-3.1-8b-instant',
-            messages,
-            max_tokens: 250,
-            temperature: 0.5,
-          })
-        } else throw e;
-      }
+      const r = await groq.chat.completions.create({
+        model: 'llama-3.3-70b-versatile',
+        messages,
+        max_tokens: 250,
+        temperature: 0.5,
+      })
       return json(res, { reply: r.choices[0].message.content })
     } catch (err) {
       console.error('[Assistant]', err.message)
@@ -546,6 +525,37 @@ Respondé en español rioplatense, mensajes cortos y claros. Sé amigable pero d
     try {
       const messages = await db.getMessages(parseInt(convMsgMatch[1]))
       return json(res, { messages })
+    } catch (err) {
+      return json(res, { error: err.message }, 500)
+    }
+  }
+
+  // POST /api/conversations/:id/messages
+  if (convMsgMatch && req.method === 'POST') {
+    try {
+      const user = await checkAuth(req, res)
+      if (!user) return
+      const body = await parseBody(req)
+      const text = body.text?.trim()
+      if (!text) return json(res, { error: 'Mensaje vacío' }, 400)
+
+      const id = parseInt(convMsgMatch[1])
+      const convs = await db.getConversations()
+      const conv = convs.find(c => c.id === id)
+      if (!conv || !conv.phone) return json(res, { error: 'Conversación no encontrada' }, 404)
+
+      if (activeSock) {
+        await activeSock.sendMessage(conv.phone + '@s.whatsapp.net', { text })
+      } else {
+        return json(res, { error: 'WhatsApp no está conectado' }, 503)
+      }
+
+      await db.saveMessage(id, 'bot', text)
+      
+      createAndPushNotif('manual_message', 'Mensaje Manual', `${user.name} envió un mensaje manual a ${conv.name || conv.phone}`)
+      console.log(`[Manual] ${user.name} envió msj a ${conv.phone}`)
+
+      return json(res, { ok: true })
     } catch (err) {
       return json(res, { error: err.message }, 500)
     }
@@ -752,23 +762,11 @@ Respondé en español rioplatense, mensajes cortos y claros. Sé amigable pero d
       if (!activeSock || connectionStatus !== 'connected') return json(res, { error: 'WhatsApp no conectado' }, 503)
       const conv = await db.getConversationWithContact(convId)
       if (!conv) return json(res, { error: 'Conversación no encontrada' }, 404)
-      const isLid = conv.phone.length >= 14 && !conv.phone.startsWith('549');
-      const targetJid = isLid ? `${conv.phone}@lid` : `${conv.phone}@s.whatsapp.net`
+      const targetJid = conv.phone.length >= 15 ? `${conv.phone}@lid` : `${conv.phone}@s.whatsapp.net`
       await activeSock.sendMessage(targetJid, { text: message.trim() })
       await db.saveMessage(convId, 'human', message.trim(), 'human')
       await db.logActivity(authUser.id, authUser.username, 'mensaje_manual', { convId, phone: conv.phone, preview: message.substring(0, 50) })
       await createAndPushNotif('human_msg', 'Mensaje manual enviado', `${authUser.name || authUser.username} → ${conv.name || conv.phone}: "${message.substring(0, 50)}"`, { convId, phone: conv.phone })
-      return json(res, { ok: true })
-    } catch (err) { return json(res, { error: err.message }, 500) }
-  }
-
-  // POST /api/conversations/:id/pause
-  const convPauseMatch = url.match(/^\/api\/conversations\/(\d+)\/pause$/)
-  if (convPauseMatch && req.method === 'POST') {
-    try {
-      const { paused } = await parseBody(req)
-      const convId = parseInt(convPauseMatch[1])
-      await db.setBotPaused(convId, !!paused)
       return json(res, { ok: true })
     } catch (err) { return json(res, { error: err.message }, 500) }
   }

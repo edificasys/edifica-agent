@@ -114,15 +114,28 @@ async function generateSummary(history, lastText, clientName) {
   ).join('\n')
 
   try {
-    const r = await groq.chat.completions.create({
-      model: 'llama-3.3-70b-versatile',
-      messages: [
-        { role: 'system', content: 'Generá un resumen breve (3-5 líneas) en español de lo que consultó el cliente y por qué quiere hablar con un asesor. Sé directo y útil para el vendedor.' },
-        { role: 'user', content: `Cliente: ${clientName}\nÚltimo mensaje: "${lastText}"\n\nHistorial:\n${historyText}` }
-      ],
-      max_tokens: 200,
-      temperature: 0.3,
-    })
+    const messages = [
+      { role: 'system', content: 'Generá un resumen breve (3-5 líneas) en español de lo que consultó el cliente y por qué quiere hablar con un asesor. Sé directo y útil para el vendedor.' },
+      { role: 'user', content: `Cliente: ${clientName}\nÚltimo mensaje: "${lastText}"\n\nHistorial:\n${historyText}` }
+    ]
+    let r;
+    try {
+      r = await groq.chat.completions.create({
+        model: 'llama-3.3-70b-versatile',
+        messages,
+        max_tokens: 200,
+        temperature: 0.3,
+      })
+    } catch (e) {
+      if (e.status === 429) {
+        r = await groq.chat.completions.create({
+          model: 'llama-3.1-8b-instant',
+          messages,
+          max_tokens: 200,
+          temperature: 0.3,
+        })
+      } else throw e;
+    }
     return r.choices[0].message.content
   } catch {
     return lastText || 'El cliente solicitó hablar con un asesor.'
@@ -225,16 +238,29 @@ export async function getAIReply({ text, hasImage, imageBuffer, hasAudio, audioB
     const summary = await generateSummary(history, text, clientName)
     const systemPrompt = await buildSystemPrompt('redireccion', settings)
     try {
-      const r = await groq.chat.completions.create({
-        model: 'llama-3.3-70b-versatile',
-        messages: [
-          { role: 'system', content: systemPrompt },
-          ...history.map(m => ({ role: m.sender === 'ai' ? 'assistant' : 'user', content: m.content || '' })),
-          { role: 'user', content: text || 'Quiero hablar con un asesor' }
-        ],
-        max_tokens: 200,
-        temperature: 0.5,
-      })
+      const messages = [
+        { role: 'system', content: systemPrompt },
+        ...history.map(m => ({ role: m.sender === 'ai' ? 'assistant' : 'user', content: m.content || '' })),
+        { role: 'user', content: text || 'Quiero hablar con un asesor' }
+      ];
+      let r;
+      try {
+        r = await groq.chat.completions.create({
+          model: 'llama-3.3-70b-versatile',
+          messages,
+          max_tokens: 200,
+          temperature: 0.5,
+        })
+      } catch (e) {
+        if (e.status === 429) {
+          r = await groq.chat.completions.create({
+            model: 'llama-3.1-8b-instant',
+            messages,
+            max_tokens: 200,
+            temperature: 0.5,
+          })
+        } else throw e;
+      }
       return { reply: r.choices[0].message.content, agentType: 'redireccion', isHandoff: true, summary }
     } catch {
       const fallback = `¡Claro! Te conecto con un asesor de EDIFICA ahora mismo 👇\n\nhttps://wa.me/543516002716\n\nYa le avisé que venís a consultar — te atiende en breve. 🙌`
@@ -256,12 +282,24 @@ export async function getAIReply({ text, hasImage, imageBuffer, hasAudio, audioB
       ...history.map(m => ({ role: m.sender === 'ai' ? 'assistant' : 'user', content: m.content || '' })),
       { role: 'user', content: text || '' }
     ]
-    const response = await groq.chat.completions.create({
-      model: 'llama-3.3-70b-versatile',
-      messages,
-      max_tokens: 300,
-      temperature: 0.7,
-    })
+    let response;
+    try {
+      response = await groq.chat.completions.create({
+        model: 'llama-3.3-70b-versatile',
+        messages,
+        max_tokens: 300,
+        temperature: 0.7,
+      })
+    } catch (e) {
+      if (e.status === 429) {
+        response = await groq.chat.completions.create({
+          model: 'llama-3.1-8b-instant',
+          messages,
+          max_tokens: 300,
+          temperature: 0.7,
+        })
+      } else throw e;
+    }
     let reply = response.choices[0].message.content
 
     // Limpiar cualquier tag residual entre corchetes
@@ -274,6 +312,6 @@ export async function getAIReply({ text, hasImage, imageBuffer, hasAudio, audioB
     return { reply, agentType, isHandoff: false, summary: null, imageInfo }
   } catch (err) {
     console.error('Error Groq:', err.message)
-    return { reply: 'Disculpá, tuve un problema técnico. Intentá de nuevo en un momento.', agentType, isHandoff: false, summary: null, imageInfo: null }
+    return { reply: 'Disculpá, tuve un problema técnico. Intentá de nuevo en un momento.', agentType, isHandoff: false, summary: null, imageInfo: null, isError: true }
   }
 }
