@@ -113,7 +113,11 @@ async function buildSystemPrompt(agentType, settings) {
     }
   } catch {}
 
-  return `${base}${businessCtx}${productContext}${faqContext}\n\nReglas: Respondé en español rioplatense, mensajes cortos y claros (WhatsApp), nunca inventes precios exactos sin visita previa. NUNCA uses frases entre corchetes como [envía fotos] ni simules acciones.`
+  const personalityCtx = settings.personality_prompt ? `\n\n━━━ TU PERSONALIDAD ━━━\n${settings.personality_prompt}` : ''
+  const restrictionsCtx = settings.restrictions ? `\n\n━━━ RESTRICCIONES (NO HACER) ━━━\n${settings.restrictions}` : ''
+  const goalsCtx = settings.goals ? `\n\n━━━ TUS OBJETIVOS ━━━\n${settings.goals}` : ''
+
+  return `${base}${businessCtx}${productContext}${faqContext}${personalityCtx}${restrictionsCtx}${goalsCtx}\n\nReglas: Respondé en español rioplatense, mensajes cortos y claros (WhatsApp), nunca inventes precios exactos sin visita previa. NUNCA uses frases entre corchetes como [envía fotos] ni simules acciones.`
 }
 
 // ── Generar resumen de conversación para el asesor ───────────────
