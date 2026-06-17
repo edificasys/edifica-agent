@@ -225,7 +225,7 @@ export async function getAIReply({ text, hasImage, imageBuffer, hasAudio, audioB
     let imageDescription = null
     try {
       const systemPrompt = await buildSystemPrompt('servicios', settings)
-      const model = genAI.getGenerativeModel({ model: 'gemini-1.5-flash' })
+      const model = genAI.getGenerativeModel({ model: 'gemini-1.5-flash-latest' })
       const imagePart = { inlineData: { data: imageBuffer.toString('base64'), mimeType: 'image/jpeg' } }
       // Descripción para el asesor (separada de la respuesta al cliente)
       const descResult = await model.generateContent([

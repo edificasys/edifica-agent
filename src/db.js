@@ -64,6 +64,9 @@ async function runMigrations() {
         ADD COLUMN IF NOT EXISTS bot_paused     BOOLEAN DEFAULT false
     `)
     await pool.query(`
+      ALTER TABLE messages ADD COLUMN IF NOT EXISTS media_url TEXT
+    `)
+    await pool.query(`
       ALTER TABLE messages DROP CONSTRAINT IF EXISTS messages_sender_check
     `)
     await pool.query(`
@@ -141,11 +144,11 @@ export const db = {
     return contact
   },
 
-  async saveMessage(conversationId, sender, content, agentType = 'generalista') {
+  async saveMessage(conversationId, sender, content, agentType = 'generalista', mediaUrl = null) {
     await pool.query(`
-      INSERT INTO messages (conversation_id, sender, type, content, agent_type)
-      VALUES ($1, $2, 'text', $3, $4)
-    `, [conversationId, sender, content, agentType])
+      INSERT INTO messages (conversation_id, sender, type, content, agent_type, media_url)
+      VALUES ($1, $2, 'text', $3, $4, $5)
+    `, [conversationId, sender, content, agentType, mediaUrl])
 
     await pool.query(
       'UPDATE conversations SET last_message_at = NOW() WHERE id = $1',
@@ -316,7 +319,7 @@ export const db = {
 
   async getMessages(conversationId) {
     const { rows } = await pool.query(`
-      SELECT id, sender, type, content, agent_type, created_at
+      SELECT id, sender, type, content, agent_type, created_at, media_url
       FROM messages
       WHERE conversation_id = $1
       ORDER BY created_at ASC

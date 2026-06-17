@@ -8,8 +8,9 @@
     "dev": "node --watch src/index.js"
   },
   "dependencies": {
-    "@google/generative-ai": "^0.21.0",
+    "@google/generative-ai": "^0.24.1",
     "@hapi/boom": "^10.0.1",
+    "@vercel/blob": "^2.4.0",
     "@whiskeysockets/baileys": "^6.7.9",
     "dotenv": "^16.4.7",
     "groq-sdk": "^0.9.0",

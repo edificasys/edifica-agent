@@ -7,6 +7,7 @@ import http from 'http'
 import dotenv from 'dotenv'
 import fs from 'fs'
 import Groq from 'groq-sdk'
+import { put } from '@vercel/blob'
 import { db } from './db.js'
 import { getAIReply } from './ai.js'
 import { sendAdminAlert, setAdminSocket } from './alerts.js'
@@ -203,9 +204,23 @@ async function connectToWhatsApp() {
 
         const { reply, agentType, isHandoff, summary, imageInfo, imageDescription } = result
 
+        let uploadedMediaUrl = null
+        if (hasImage && imageBuffer && process.env.BLOB_READ_WRITE_TOKEN) {
+          try {
+            const blob = await put(`whatsapp/${Date.now()}.jpg`, imageBuffer, {
+              access: 'public',
+              token: process.env.BLOB_READ_WRITE_TOKEN
+            })
+            uploadedMediaUrl = blob.url
+            console.log('[Blob] Imagen subida a Vercel:', uploadedMediaUrl)
+          } catch (err) {
+            console.error('[Blob] Error subiendo imagen:', err.message)
+          }
+        }
+
         // Si el cliente mandó imagen, guardar la descripción como contexto en el historial
         const saved = text || (hasImage && imageDescription ? `[imagen: ${imageDescription.substring(0, 100)}]` : hasImage ? '[imagen]' : hasAudio ? '[audio]' : '[mensaje]')
-        await db.saveMessage(contact.conversation_id, 'client', saved, 'cliente')
+        await db.saveMessage(contact.conversation_id, 'client', saved, 'cliente', uploadedMediaUrl)
         await db.saveMessage(contact.conversation_id, 'ai', reply, agentType)
         await sock.sendMessage(msg.key.remoteJid, { text: reply })
 
