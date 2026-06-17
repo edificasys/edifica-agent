@@ -71,6 +71,15 @@ async function buildSystemPrompt(agentType, settings) {
     if (ca) base = ca.prompt || ''
   }
 
+  if (agentType === 'redireccion' && !agentOverride) {
+    if (settings.advisors && settings.advisors.length > 0) {
+      const advList = settings.advisors.map(a => `- ${a.name || 'Asesor'} (Especialidad: ${a.role || 'General'}): https://wa.me/${a.phone}`).join('\n')
+      base = `Sos el agente de derivación de EDIFICA. El cliente quiere hablar con un asesor humano. Tu respuesta debe: 1) Agradecerle por su consulta, 2) Elegir al asesor más adecuado para su caso y darle su link de WhatsApp. Opciones de asesores:\n${advList}\n\nSolo podés pasar UN link. 3) Decirle que el asesor ya tiene el resumen de su consulta y lo va a atender rápido. Sé cálido y breve.`
+    } else if (settings.redirect_phone) {
+      base = base.replace(/543516002716/g, settings.redirect_phone).replace(/5493516002716/g, settings.redirect_phone)
+    }
+  }
+
   const businessCtx = `\nNegocio: ${settings.business_description || 'EDIFICA Obras y Servicios, Córdoba'}
 📍 Showroom: Mauricio Yadarola 795 | ⏰ L-V 9-18hs | 📧 contactanos@edifica.com | 📱 +54 9 3518 00-7584`
 
@@ -261,17 +270,24 @@ export async function getAIReply({ text, hasImage, imageBuffer, hasAudio, audioB
           })
         } else throw e;
       }
-      return { reply: r.choices[0].message.content, agentType: 'redireccion', isHandoff: true, summary }
+      const replyText = r.choices[0].message.content
+      const match = replyText.match(/wa\.me\/(\d+)/)
+      const handoff_target = match ? match[1] : null
+      return { reply: replyText, agentType: 'redireccion', isHandoff: true, summary, handoff_target }
     } catch {
-      const fallback = `¡Claro! Te conecto con un asesor de EDIFICA ahora mismo 👇\n\nhttps://wa.me/543516002716\n\nYa le avisé que venís a consultar — te atiende en breve. 🙌`
-      return { reply: fallback, agentType: 'redireccion', isHandoff: true, summary }
+      let defaultPhone = '543516002716'
+      if (settings.advisors && settings.advisors.length > 0) defaultPhone = settings.advisors[0].phone
+      else if (settings.redirect_phone) defaultPhone = settings.redirect_phone
+      const fallback = `¡Claro! Te conecto con un asesor de EDIFICA ahora mismo 👇\n\nhttps://wa.me/${defaultPhone}\n\nYa le avisé que venís a consultar — te atiende en breve. 🙌`
+      return { reply: fallback, agentType: 'redireccion', isHandoff: true, summary, handoff_target: defaultPhone }
     }
   }
 
   // Contexto de imágenes ya enviadas en esta conversación
   const sentNames = Object.values(imagesSent).map(v => v.name).filter(Boolean)
+  const defaultAdvPhone = settings.advisors?.[0]?.phone || settings.redirect_phone || '543516002716'
   const imagesCtx = sentNames.length > 0
-    ? `\n\n⚠️ Ya enviaste imagen de: ${sentNames.join(', ')}. Si el cliente insiste en esos productos con medidas u otros detalles específicos, derivalo al asesor (https://wa.me/543516002716) para atención personalizada. NO repitas la imagen.`
+    ? `\n\n⚠️ Ya enviaste imagen de: ${sentNames.join(', ')}. Si el cliente insiste en esos productos con medidas u otros detalles específicos, derivalo al asesor (https://wa.me/${defaultAdvPhone}) para atención personalizada. NO repitas la imagen.`
     : ''
 
   // Respuesta de texto normal con agente especializado
