@@ -199,7 +199,7 @@ async function connectToWhatsApp() {
           continue
         }
 
-        const result = await getAIReply({ text, hasImage, imageBuffer, hasAudio, audioBuffer, audioMime, history, clientName: msg.pushName || identifier, imagesSent })
+        const result = await getAIReply({ text, hasImage, imageBuffer, hasAudio, audioBuffer, audioMime, history, clientName: msg.pushName || identifier, imagesSent, isFirstMessage })
 
         const { reply, agentType, isHandoff, summary, imageInfo, imageDescription } = result
 

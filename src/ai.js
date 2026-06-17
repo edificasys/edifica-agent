@@ -201,7 +201,7 @@ async function findProductImage(text, agentType) {
 }
 
 // ── Respuesta principal ──────────────────────────────────────────
-export async function getAIReply({ text, hasImage, imageBuffer, hasAudio, audioBuffer, audioMime, history, clientName = '', agentTypeOverride = null, imagesSent = {} }) {
+export async function getAIReply({ text, hasImage, imageBuffer, hasAudio, audioBuffer, audioMime, history, clientName = '', agentTypeOverride = null, imagesSent = {}, isFirstMessage = false }) {
   const settings = await db.getAISettings()
 
   // Audio → transcribir primero
@@ -302,21 +302,32 @@ export async function getAIReply({ text, hasImage, imageBuffer, hasAudio, audioB
       ...history.map(m => ({ role: m.sender === 'ai' ? 'assistant' : 'user', content: m.content || '' })),
       { role: 'user', content: text || '' }
     ]
+
+    const reinforcement = `\n\n[SISTEMA: REGLAS ESTRICTAS E INQUEBRANTABLES:
+${settings.personality_prompt ? settings.personality_prompt : 'Sé muy breve y conciso.'}
+${settings.restrictions ? `PROHIBIDO ESTRICTAMENTE: ${settings.restrictions}` : ''}
+TU RESPUESTA NO DEBE SUPERAR BAJO NINGÚN CONCEPTO LAS 3 LÍNEAS DE TEXTO. No hagas listas largas ni mandes párrafos grandes de texto. Respondé la consulta de forma útil pero extremadamente corta.]`
+
+    if (isFirstMessage && settings.welcome_message) {
+      messages[messages.length - 1].content += `\n\n[SISTEMA: Este es el primer contacto del cliente. DEBES iniciar tu respuesta saludando EXACTAMENTE con este mensaje de bienvenida: "${settings.welcome_message}". Luego responde su consulta respetando la regla estricta de no superar las 3 líneas.]`
+    } else {
+      messages[messages.length - 1].content += reinforcement
+    }
     let response;
     try {
       response = await groq.chat.completions.create({
         model: 'llama-3.3-70b-versatile',
         messages,
-        max_tokens: 300,
-        temperature: 0.7,
+        max_tokens: 200,
+        temperature: 0.5,
       })
     } catch (e) {
       if (e.status === 429) {
         response = await groq.chat.completions.create({
           model: 'llama-3.1-8b-instant',
           messages,
-          max_tokens: 300,
-          temperature: 0.7,
+          max_tokens: 200,
+          temperature: 0.5,
         })
       } else throw e;
     }
