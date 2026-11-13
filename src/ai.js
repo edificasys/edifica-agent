@@ -1,3 +1,4 @@
+import 'dotenv/config'
 import Groq from 'groq-sdk'
 import { GoogleGenerativeAI } from '@google/generative-ai'
 import { createReadStream } from 'fs'
@@ -8,6 +9,83 @@ import { db } from './db.js'
 
 const groq = new Groq({ apiKey: process.env.GROQ_API_KEY })
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY)
+
+// ── Modelos de Groq con fallback automático para evitar 404 / 429 ─
+const FALLBACK_MODELS = [
+  'llama-3.1-8b-instant',
+  'llama-3.3-70b-versatile',
+  'llama-3.1-70b-versatile',
+  'llama3-70b-8192',
+  'llama3-8b-8192',
+  'mixtral-8x7b-32768'
+]
+
+async function createGroqChat(messages, max_tokens = 300, temperature = 0.5) {
+  let lastErr = null
+  for (const model of FALLBACK_MODELS) {
+    try {
+      const response = await groq.chat.completions.create({
+        model,
+        messages,
+        max_tokens,
+        temperature,
+      })
+      return response
+    } catch (err) {
+      lastErr = err
+      console.warn(`[Groq Fallback] Modelo "${model}" falló (${err.status || err.message}). Probando siguiente...`)
+      if (err.status === 401) throw err // Error de API key
+    }
+  }
+  throw lastErr
+}
+
+// ── Obtener información dinámica de asesores (Mi Negocio) ────────
+export function getAdvisorInfo(settings, preference = null) {
+  const advisors = Array.isArray(settings?.advisors) ? settings.advisors : []
+
+  // 1. Buscar asesor que coincida con la especialidad o nombre
+  if (preference && advisors.length > 0) {
+    const pref = preference.toLowerCase()
+    const match = advisors.find(a =>
+      a.phone && (
+        (a.role && a.role.toLowerCase().includes(pref)) ||
+        (a.name && a.name.toLowerCase().includes(pref))
+      )
+    )
+    if (match) {
+      const cleanPhone = String(match.phone).replace(/[^0-9]/g, '')
+      return {
+        name: match.name || 'Asesor',
+        phone: cleanPhone,
+        role: match.role || 'Especialista',
+        link: cleanPhone ? `https://wa.me/${cleanPhone}` : ''
+      }
+    }
+  }
+
+  // 2. Primer asesor cargado con teléfono válido en la lista de asesores
+  const firstWithPhone = advisors.find(a => a.phone && String(a.phone).trim())
+  if (firstWithPhone) {
+    const cleanPhone = String(firstWithPhone.phone).replace(/[^0-9]/g, '')
+    return {
+      name: firstWithPhone.name || 'Asesor',
+      phone: cleanPhone,
+      role: firstWithPhone.role || 'General',
+      link: cleanPhone ? `https://wa.me/${cleanPhone}` : ''
+    }
+  }
+
+  // 3. Fallback a redirect_phone o admin_phone configurado en la BD / env
+  const fallback = settings?.redirect_phone || settings?.admin_phone || process.env.REDIRECT_PHONE || process.env.ADMIN_PHONE || ''
+  const cleanFallback = String(fallback).replace(/[^0-9]/g, '')
+  return {
+    name: 'Asesor',
+    phone: cleanFallback,
+    role: 'General',
+    link: cleanFallback ? `https://wa.me/${cleanFallback}` : ''
+  }
+}
 
 // ── Detección de tipo de agente (sin API call extra) ─────────────
 function detectAgentType(text, settings, history = []) {
@@ -115,10 +193,10 @@ PASO A PASO:
 5. SI EL CLIENTE CONFIRMA (ej: "sí", "correcto", "está bien", "perfecto", "confirmado", "dale", "avanzá"):
    Decile que ya registraste la planilla y que se la derivaste al Asesor Técnico para cotización exacta:
    "¡Excelente! Tu Planilla de Medidas ya quedó registrada y se la envié a nuestro Asesor Técnico 👇
-   https://wa.me/543516002716
+   {{ADVISOR_LINK}}
    El asesor ya tiene todas las medidas relevadas para armarte la cotización exacta y coordinar con producción. ¡Muchas gracias!"`,
 
-  redireccion: `Sos el agente de derivación de EDIFICA. El cliente quiere hablar con un asesor humano. Tu respuesta debe: 1) Agradecerle por su consulta, 2) Dar el link de WhatsApp del asesor: https://wa.me/543516002716, 3) Decirle que el asesor ya tiene el resumen de su consulta y lo va a atender rápido. Sé cálido y breve.`,
+  redireccion: `Sos el agente de derivación de EDIFICA. El cliente quiere hablar con un asesor humano. Tu respuesta debe: 1) Agradecerle por su consulta, 2) Dar el link de WhatsApp del asesor: {{ADVISOR_LINK}}, 3) Decirle que el asesor ya tiene el resumen de su consulta y lo va a atender rápido. Sé cálido y breve.`,
 
   recontacto: `Sos EDY, asistente de EDIFICA. Estás retomando una conversación con un cliente que quedó inconclusa. Tu objetivo es: 1) Saludar cordialmente recordándoles que habían hablado antes, 2) Preguntar si pudo avanzar o si necesita algo más, 3) Si estaba esperando información, ofrecele nueva ayuda o derivalo con un asesor. Sé breve, cálido y no insistente.`,
 }
@@ -134,13 +212,26 @@ async function buildSystemPrompt(agentType, settings) {
     if (ca) base = ca.prompt || ''
   }
 
+  // Obtener asesor dinámico según la sección Mi Negocio -> Asesores para derivaciones
+  const adv = getAdvisorInfo(settings, agentType)
+
   if (agentType === 'redireccion' && !agentOverride) {
-    if (settings.advisors && settings.advisors.length > 0) {
-      const advList = settings.advisors.map(a => `- ${a.name || 'Asesor'} (Especialidad: ${a.role || 'General'}): https://wa.me/${a.phone}`).join('\n')
-      base = `Sos el agente de derivación de EDIFICA. El cliente quiere hablar con un asesor humano. Tu respuesta debe: 1) Agradecerle por su consulta, 2) Elegir al asesor más adecuado para su caso y darle su link de WhatsApp. Opciones de asesores:\n${advList}\n\nSolo podés pasar UN link. 3) Decirle que el asesor ya tiene el resumen de su consulta y lo va a atender rápido. Sé cálido y breve.`
-    } else if (settings.redirect_phone) {
-      base = base.replace(/543516002716/g, settings.redirect_phone).replace(/5493516002716/g, settings.redirect_phone)
+    const validAdvisors = Array.isArray(settings.advisors) ? settings.advisors.filter(a => a.phone && String(a.phone).trim()) : []
+    if (validAdvisors.length > 1) {
+      const advList = validAdvisors.map(a => {
+        const cleanP = String(a.phone).replace(/[^0-9]/g, '')
+        return `- ${a.name || 'Asesor'} (Especialidad: ${a.role || 'General'}): https://wa.me/${cleanP}`
+      }).join('\n')
+      base = `Sos el agente de derivación de EDIFICA. El cliente quiere hablar con un asesor humano. Tu respuesta debe: 1) Agradecerle por su consulta, 2) Elegir al asesor más adecuado para su caso y darle su link de WhatsApp. Opciones de asesores:\n${advList}\n\nSolo podés pasar UN link (el más pertinente para la consulta). 3) Decirle que el asesor ya tiene el resumen de su consulta y lo va a atender rápido. Sé cálido y breve.`
     }
+  }
+
+  // Reemplazar marcador dinámico {{ADVISOR_LINK}}
+  base = base.replace(/\{\{ADVISOR_LINK\}\}/g, adv.link || '')
+
+  // Eliminar cualquier número hardcodeado remanente en prompts personalizados de la base de datos
+  if (adv.phone) {
+    base = base.replace(/543516002716/g, adv.phone).replace(/5493516002716/g, adv.phone)
   }
 
   const businessCtx = `\nNegocio: ${settings.business_description || 'EDIFICA Obras y Servicios, Córdoba'}
@@ -194,24 +285,7 @@ async function generateSummary(history, lastText, clientName) {
       { role: 'system', content: 'Generá un resumen breve (3-5 líneas) en español de lo que consultó el cliente y por qué quiere hablar con un asesor. Sé directo y útil para el vendedor.' },
       { role: 'user', content: `Cliente: ${clientName}\nÚltimo mensaje: "${lastText}"\n\nHistorial:\n${historyText}` }
     ]
-    let r;
-    try {
-      r = await groq.chat.completions.create({
-        model: 'llama-3.3-70b-versatile',
-        messages,
-        max_tokens: 200,
-        temperature: 0.3,
-      })
-    } catch (e) {
-      if (e.status === 429) {
-        r = await groq.chat.completions.create({
-          model: 'llama-3.1-8b-instant',
-          messages,
-          max_tokens: 200,
-          temperature: 0.3,
-        })
-      } else throw e;
-    }
+    const r = await createGroqChat(messages, 200, 0.3)
     return r.choices[0].message.content
   } catch {
     return lastText || 'El cliente solicitó hablar con un asesor.'
@@ -315,48 +389,32 @@ export async function getAIReply({ text, hasImage, imageBuffer, hasAudio, audioB
   if (isHandoff) {
     const summary = await generateSummary(history, text, clientName)
     const systemPrompt = await buildSystemPrompt('redireccion', settings)
+    const adv = getAdvisorInfo(settings, 'redireccion')
     try {
       const messages = [
         { role: 'system', content: systemPrompt },
         ...history.map(m => ({ role: m.sender === 'ai' ? 'assistant' : 'user', content: m.content || '' })),
         { role: 'user', content: text || 'Quiero hablar con un asesor' }
       ];
-      let r;
-      try {
-        r = await groq.chat.completions.create({
-          model: 'llama-3.3-70b-versatile',
-          messages,
-          max_tokens: 200,
-          temperature: 0.5,
-        })
-      } catch (e) {
-        if (e.status === 429) {
-          r = await groq.chat.completions.create({
-            model: 'llama-3.1-8b-instant',
-            messages,
-            max_tokens: 200,
-            temperature: 0.5,
-          })
-        } else throw e;
-      }
+      const r = await createGroqChat(messages, 200, 0.5)
       const replyText = r.choices[0].message.content
       const match = replyText.match(/wa\.me\/(\d+)/)
-      const handoff_target = match ? match[1] : null
+      const handoff_target = match ? match[1] : (adv.phone || null)
       return { reply: replyText, agentType: 'redireccion', isHandoff: true, summary, handoff_target }
-    } catch {
-      let defaultPhone = '543516002716'
-      if (settings.advisors && settings.advisors.length > 0) defaultPhone = settings.advisors[0].phone
-      else if (settings.redirect_phone) defaultPhone = settings.redirect_phone
-      const fallback = `¡Claro! Te conecto con un asesor de EDIFICA ahora mismo 👇\n\nhttps://wa.me/${defaultPhone}\n\nYa le avisé que venís a consultar — te atiende en breve. 🙌`
-      return { reply: fallback, agentType: 'redireccion', isHandoff: true, summary, handoff_target: defaultPhone }
+    } catch (err) {
+      console.error('[AI Redireccion] Error Groq:', err.message)
+      const targetPhone = adv.phone || ''
+      const fallbackLink = adv.link ? `\n\n${adv.link}` : ''
+      const fallback = `¡Claro! Te conecto con un asesor de EDIFICA ahora mismo 👇${fallbackLink}\n\nYa le avisé que venís a consultar — te atiende en breve. 🙌`
+      return { reply: fallback, agentType: 'redireccion', isHandoff: true, summary, handoff_target: targetPhone }
     }
   }
 
   // Contexto de imágenes ya enviadas en esta conversación
   const sentNames = Object.values(imagesSent).map(v => v.name).filter(Boolean)
-  const defaultAdvPhone = settings.advisors?.[0]?.phone || settings.redirect_phone || '543516002716'
+  const advisorForImages = getAdvisorInfo(settings, 'productos')
   const imagesCtx = sentNames.length > 0
-    ? `\n\n⚠️ Ya enviaste imagen de: ${sentNames.join(', ')}. Si el cliente insiste en esos productos con medidas u otros detalles específicos, derivalo al asesor (https://wa.me/${defaultAdvPhone}) para atención personalizada. NO repitas la imagen.`
+    ? `\n\n⚠️ Ya enviaste imagen de: ${sentNames.join(', ')}. Si el cliente insiste en esos productos con medidas u otros detalles específicos, derivalo al asesor (${advisorForImages.link || 'con nuestro asesor'}) para atención personalizada. NO repitas la imagen.`
     : ''
 
   // Respuesta de texto normal con agente especializado
@@ -382,25 +440,8 @@ TU RESPUESTA NO DEBE SUPERAR BAJO NINGÚN CONCEPTO LAS 3 LÍNEAS DE TEXTO. No ha
     }
 
     const maxTokens = agentType === 'medidas' ? 650 : 200
-
-    let response;
-    try {
-      response = await groq.chat.completions.create({
-        model: 'llama-3.3-70b-versatile',
-        messages,
-        max_tokens: maxTokens,
-        temperature: agentType === 'medidas' ? 0.3 : 0.5,
-      })
-    } catch (e) {
-      if (e.status === 429) {
-        response = await groq.chat.completions.create({
-          model: 'llama-3.1-8b-instant',
-          messages,
-          max_tokens: maxTokens,
-          temperature: agentType === 'medidas' ? 0.3 : 0.5,
-        })
-      } else throw e;
-    }
+    const temperature = agentType === 'medidas' ? 0.3 : 0.5
+    const response = await createGroqChat(messages, maxTokens, temperature)
     let reply = response.choices[0].message.content
 
     // Limpiar cualquier tag residual entre corchetes (pero no corchetes de texto informativo)

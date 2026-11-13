@@ -9,7 +9,7 @@ import fs from 'fs'
 import Groq from 'groq-sdk'
 import { put } from '@vercel/blob'
 import { db } from './db.js'
-import { getAIReply } from './ai.js'
+import { getAIReply, getAdvisorInfo } from './ai.js'
 import { sendAdminAlert, setAdminSocket } from './alerts.js'
 
 dotenv.config()
@@ -134,12 +134,13 @@ async function connectToWhatsApp() {
 
       console.log(`[MSG] jid=${jid} id=${identifier} lid=${isLid} name=${msg.pushName}`)
 
-      // Leer config de BD (teléfonos se gestionan desde el dashboard, no variables de entorno)
+      // Leer config de BD (teléfonos se gestionan desde el dashboard en Mi Negocio -> Asesores)
       const settings = await db.getAISettings().catch(() => null)
-      const ADMIN    = settings?.admin_phone    || process.env.ADMIN_PHONE    || '5493516002716'
-      const REDIRECT = settings?.redirect_phone || process.env.REDIRECT_PHONE || '5493516002716'
+      const advisorInfo = getAdvisorInfo(settings)
+      const ADMIN    = settings?.admin_phone    || process.env.ADMIN_PHONE    || advisorInfo.phone || ''
+      const REDIRECT = settings?.redirect_phone || process.env.REDIRECT_PHONE || advisorInfo.phone || ''
 
-      if (identifier === ADMIN) continue
+      if (ADMIN && identifier === ADMIN) continue
 
       // Blacklist global (nadie puede chatear)
       if (settings?.blacklist_all) {
@@ -295,7 +296,10 @@ async function connectToWhatsApp() {
           // Si el producto existe pero no tiene imagen cargada
           if (!imageInfo.imageData) {
             const prodDesc = imageInfo.productDescription ? `\n\n${imageInfo.productDescription}` : ''
-            await sock.sendMessage(msg.key.remoteJid, { text: `Por el momento estamos cargando las imágenes de ${imageInfo.productName}.${prodDesc}\n\nPronto las podrás ver aquí. Si querés más detalles, podés contactar a nuestro asesor 👇\nhttps://wa.me/543516002716` })
+            const advisorLinkMsg = advisorInfo.link
+              ? `\n\nPronto las podrás ver aquí. Si querés más detalles, podés contactar a nuestro asesor 👇\n${advisorInfo.link}`
+              : `\n\nPronto las podrás ver aquí. Dejanos tu consulta y te responderemos a la brevedad.`
+            await sock.sendMessage(msg.key.remoteJid, { text: `Por el momento estamos cargando las imágenes de ${imageInfo.productName}.${prodDesc}${advisorLinkMsg}` })
             await createAndPushNotif('missing_image', `Imagen faltante: ${imageInfo.productName}`, `${msg.pushName || identifier} pidió ver "${imageInfo.productName}" pero no tiene imágenes cargadas`, { convId: contact.conversation_id, phone: identifier, productId: imageInfo.productId, productName: imageInfo.productName })
           }
         } else if (agentType === 'productos' && /foto|imagen|ver|mostrá|catálogo/i.test(text || '')) {
@@ -498,13 +502,19 @@ const server = http.createServer(async (req, res) => {
       const { message, history = [] } = await parseBody(req)
       if (!message?.trim()) return json(res, { reply: '¿En qué te ayudo?' })
 
+      const settings = await db.getAISettings().catch(() => null)
+      const advisor = getAdvisorInfo(settings)
+      const escalationMsg = advisor.link
+        ? `contactar a un asesor o soporte técnico: ${advisor.link}`
+        : 'contactar a un asesor de EDIFICA.'
+
       const SYSTEM = `Sos EDY, el asistente virtual del dashboard de AIWorker para EDIFICA.
 Ayudás a los usuarios del sistema (administradores y asesores) a:
 - Navegar el dashboard: Panel de Control, Conversaciones (inbox WhatsApp), Mi Negocio (productos/servicios/turnos), Agentes IA, Notificaciones, Usuarios
 - Resolver problemas comunes: WhatsApp desconectado (ir a Panel → escanear QR), notificaciones que no llegan (revisar conexión SSE), imágenes que no se envían (verificar que el producto tenga "puede enviar imagen" activado y la imagen cargada), login que falla (verificar que el servidor Render esté activo — puede tardar 30s en iniciar)
-- Explicar módulos: Conversaciones tiene inbox en tiempo real + toma de control manual; Agentes IA muestra los 5 agentes nativos (generalista, servicios, productos, cotización, redirección) más personalizados; Gestión de Turnos tiene calendario semanal/mensual; Notificaciones tiene SSE en tiempo real con filtros
+- Explicar módulos: Conversaciones tiene inbox en tiempo real + toma de control manual; Agentes IA muestra los 5 agentes nativos (generalista, servicios, productos, cotización, redirección, planilla de medidas) más personalizados; Gestión de Turnos tiene calendario semanal/mensual; Notificaciones tiene SSE en tiempo real con filtros
 - Diagnóstico: si el usuario reporta que algo no funciona, pedile que te describa qué ve, qué intentó y el error si hay uno
-- Escalado: si no podés resolver el problema en 2-3 intentos, recomendá contactar al AI Engineer Nico France: https://wa.me/5493516002716
+- Escalado: si no podés resolver el problema en 2-3 intentos, recomendá ${escalationMsg}
 
 Respondé en español rioplatense, mensajes cortos y claros. Sé amigable pero directo. Si el problema es técnico y complejo, decí honestamente qué podés y qué no podés resolver remotamente.`
 
@@ -514,28 +524,29 @@ Respondé en español rioplatense, mensajes cortos y claros. Sé amigable pero d
         ...history.slice(-6).map(m => ({ role: m.role, content: m.content || m.text || '' })),
         { role: 'user', content: message }
       ]
-      let r;
-      try {
-        r = await groq.chat.completions.create({
-          model: 'llama-3.3-70b-versatile',
-          messages,
-          max_tokens: 250,
-          temperature: 0.5,
-        })
-      } catch (e) {
-        if (e.status === 429) {
+      let r = null;
+      const modelsToTry = ['llama-3.1-8b-instant', 'llama-3.3-70b-versatile', 'llama-3.1-70b-versatile', 'llama3-8b-8192']
+      for (const m of modelsToTry) {
+        try {
           r = await groq.chat.completions.create({
-            model: 'llama-3.1-8b-instant',
+            model: m,
             messages,
             max_tokens: 250,
             temperature: 0.5,
           })
-        } else throw e;
+          break
+        } catch (e) {
+          if (e.status === 401) throw e
+        }
       }
+      if (!r) throw new Error('Todos los modelos de Groq fallaron')
       return json(res, { reply: r.choices[0].message.content })
     } catch (err) {
       console.error('[Assistant]', err.message)
-      return json(res, { reply: `Tuve un problema técnico.\n\nSi el problema persiste, contactá al AI Engineer:\nhttps://wa.me/5493516002716` })
+      const settings = await db.getAISettings().catch(() => null)
+      const advisor = getAdvisorInfo(settings)
+      const fallbackHelp = advisor.link ? `\n\nPodés contactar al asesor aquí:\n${advisor.link}` : ''
+      return json(res, { reply: `Tuve un problema técnico.${fallbackHelp}` })
     }
   }
 
@@ -954,8 +965,12 @@ Respondé en español rioplatense, mensajes cortos y claros. Sé amigable pero d
       // Notificar al asesor por WhatsApp
       if (activeSock && connectionStatus === 'connected') {
         const msg = `📅 *Nuevo turno agendado*\n\nServicio: ${appt.service}\nFecha: ${appt.appt_date}\nHorario: ${appt.time_start}\nDuración: ${appt.duration}min\nAgente: ${appt.agent_name || '-'}\nNotas: ${appt.notes || '-'}\n\n⏰ ${new Date().toLocaleString('es-AR', { timeZone: 'America/Argentina/Buenos_Aires' })}`
-        const adminPhone = process.env.ADMIN_PHONE || '5493516002716'
-        try { await activeSock.sendMessage(`${adminPhone}@s.whatsapp.net`, { text: msg }) } catch {}
+        const settings = await db.getAISettings().catch(() => null)
+        const advisorInfo = getAdvisorInfo(settings)
+        const notifyPhone = settings?.admin_phone || process.env.ADMIN_PHONE || advisorInfo.phone
+        if (notifyPhone) {
+          try { await activeSock.sendMessage(`${String(notifyPhone).replace(/[^0-9]/g, '')}@s.whatsapp.net`, { text: msg }) } catch {}
+        }
       }
       await createAndPushNotif('turno', 'Turno agendado', `${appt.service} — ${appt.appt_date} ${appt.time_start}`, { apptId: appt.id })
       return json(res, { ok: true, appointment: appt })
