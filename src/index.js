@@ -127,9 +127,10 @@ async function connectToWhatsApp() {
         continue
       }
 
-      const identifier = isPhone
-        ? jid.replace('@s.whatsapp.net', '')
-        : jid.replace('@lid', '')
+      // Obtener el número real si viene en alt o participant
+      const realPhoneJid = msg.key?.remoteJidAlt || (isPhone ? jid : null)
+      const realPhone = realPhoneJid ? realPhoneJid.replace('@s.whatsapp.net', '') : null
+      const identifier = realPhone || (isPhone ? jid.replace('@s.whatsapp.net', '') : jid.replace('@lid', ''))
 
       console.log(`[MSG] jid=${jid} id=${identifier} lid=${isLid} name=${msg.pushName}`)
 
@@ -178,7 +179,7 @@ async function connectToWhatsApp() {
           try { audioBuffer = await downloadMediaMessage(msg, 'buffer', {}) } catch (e) { console.error('[AUDIO] Error descarga:', e.message) }
         }
 
-        const contact = await db.upsertContact(identifier, msg.pushName || '')
+        const contact = await db.upsertContact(identifier, msg.pushName || '', jid)
 
         // Detectar si es primer mensaje de este contacto (history vacío antes de guardar)
         const prevHistory = await db.getRecentMessages(contact.conversation_id, 1)
@@ -195,34 +196,85 @@ async function connectToWhatsApp() {
         const convInfo = await db.getConversationWithContact(contact.conversation_id)
         if (convInfo?.bot_paused) {
           const saved = text || (hasImage ? '[imagen]' : hasAudio ? '[audio]' : '[mensaje]')
-          await db.saveMessage(contact.conversation_id, 'client', saved, 'cliente')
+          await db.saveMessage(contact.conversation_id, 'client', saved, 'cliente', null, hasAudio ? 'audio' : hasImage ? 'image' : 'text')
           await createAndPushNotif('conv_active', 'Mensaje (bot en pausa)', `${msg.pushName || identifier}: "${saved.substring(0, 60)}"`, { convId: contact.conversation_id, phone: identifier, name: msg.pushName || '' })
           continue
         }
 
         const result = await getAIReply({ text, hasImage, imageBuffer, hasAudio, audioBuffer, audioMime, history, clientName: msg.pushName || identifier, imagesSent, isFirstMessage })
 
-        const { reply, agentType, isHandoff, summary, imageInfo, imageDescription } = result
+        const { reply, agentType, isHandoff, isPlanillaHandoff, summary, imageInfo, imageDescription, transcribedText } = result
 
         let uploadedMediaUrl = null
-        if (hasImage && imageBuffer && process.env.BLOB_READ_WRITE_TOKEN) {
-          try {
-            const blob = await put(`whatsapp/${Date.now()}.jpg`, imageBuffer, {
-              access: 'public',
-              token: process.env.BLOB_READ_WRITE_TOKEN
-            })
-            uploadedMediaUrl = blob.url
-            console.log('[Blob] Imagen subida a Vercel:', uploadedMediaUrl)
-          } catch (err) {
-            console.error('[Blob] Error subiendo imagen:', err.message)
+        const msgType = hasAudio ? 'audio' : hasImage ? 'image' : 'text'
+
+        if (hasImage && imageBuffer) {
+          if (process.env.BLOB_READ_WRITE_TOKEN) {
+            try {
+              const blob = await put(`whatsapp/${Date.now()}.jpg`, imageBuffer, {
+                access: 'public',
+                token: process.env.BLOB_READ_WRITE_TOKEN
+              })
+              uploadedMediaUrl = blob.url
+              console.log('[Blob] Imagen subida a Vercel:', uploadedMediaUrl)
+            } catch (err) {
+              console.error('[Blob] Error subiendo imagen:', err.message)
+            }
+          }
+          // Fallback a Base64 data URL para asegurar visualización en el dashboard
+          if (!uploadedMediaUrl) {
+            uploadedMediaUrl = `data:image/jpeg;base64,${imageBuffer.toString('base64')}`
           }
         }
 
-        // Si el cliente mandó imagen, guardar la descripción como contexto en el historial
-        const saved = text || (hasImage && imageDescription ? `[imagen: ${imageDescription.substring(0, 100)}]` : hasImage ? '[imagen]' : hasAudio ? '[audio]' : '[mensaje]')
-        await db.saveMessage(contact.conversation_id, 'client', saved, 'cliente', uploadedMediaUrl)
-        await db.saveMessage(contact.conversation_id, 'ai', reply, agentType)
-        await sock.sendMessage(msg.key.remoteJid, { text: reply })
+        if (hasAudio && audioBuffer) {
+          if (process.env.BLOB_READ_WRITE_TOKEN) {
+            try {
+              const ext = audioMime.includes('mp4') ? 'm4a' : audioMime.includes('mpeg') ? 'mp3' : 'ogg'
+              const blob = await put(`whatsapp/${Date.now()}.${ext}`, audioBuffer, {
+                access: 'public',
+                token: process.env.BLOB_READ_WRITE_TOKEN
+              })
+              uploadedMediaUrl = blob.url
+              console.log('[Blob] Audio subido a Vercel:', uploadedMediaUrl)
+            } catch (err) {
+              console.error('[Blob] Error subiendo audio:', err.message)
+            }
+          }
+          // Fallback a Base64 data URL para reproducción de audio en el dashboard
+          if (!uploadedMediaUrl) {
+            const cleanMime = audioMime.split(';')[0] || 'audio/ogg'
+            uploadedMediaUrl = `data:${cleanMime};base64,${audioBuffer.toString('base64')}`
+          }
+        }
+
+        // Formatear mensaje para el historial y chat
+        let saved = text || ''
+        if (hasAudio) {
+          saved = transcribedText ? `🎤 [Audio transcripto]: "${transcribedText}"` : '🎤 [Audio recibido]'
+        } else if (hasImage) {
+          saved = imageDescription ? (text ? `${text} 🖼️ [Imagen: ${imageDescription.substring(0, 100)}]` : `🖼️ [Imagen: ${imageDescription.substring(0, 120)}]`) : (text ? `${text} 🖼️ [Imagen]` : '🖼️ [Imagen]')
+        } else if (!saved) {
+          saved = '[Mensaje]'
+        }
+
+        await db.saveMessage(contact.conversation_id, 'client', saved, 'cliente', uploadedMediaUrl, msgType)
+        await db.saveMessage(contact.conversation_id, 'ai', reply, agentType, null, 'text')
+
+        // Enviar respuesta al cliente vía WhatsApp
+        try {
+          await sock.sendMessage(msg.key.remoteJid, { text: reply })
+        } catch (sendErr) {
+          console.error(`[WA Send Error to ${msg.key.remoteJid}]:`, sendErr.message)
+          if (msg.key.remoteJid?.endsWith('@lid') && identifier && !identifier.includes('@') && identifier !== jid.replace('@lid', '')) {
+            try {
+              await sock.sendMessage(`${identifier}@s.whatsapp.net`, { text: reply })
+              console.log(`[WA Send] Reintento exitoso a ${identifier}@s.whatsapp.net`)
+            } catch (retryErr) {
+              console.error(`[WA Send Retry Error]:`, retryErr.message)
+            }
+          }
+        }
 
         // Enviar imagen de producto (solo si no fue enviada ya en esta conversación)
         if (imageInfo) {
@@ -250,15 +302,41 @@ async function connectToWhatsApp() {
           await createAndPushNotif('missing_image', 'Cliente pide imágenes', `${msg.pushName || identifier} pidió ver imágenes/catálogo pero no se encontró producto específico`, { convId: contact.conversation_id, phone: identifier })
         }
 
-        // Notificación: primer contacto
+        // Notificación: primer contacto o conversación activa
         if (isFirstMessage) {
           await createAndPushNotif('new_contact', 'Nuevo cliente', `${msg.pushName || identifier} se contactó por primera vez`, { convId: contact.conversation_id, phone: identifier, name: msg.pushName || '' })
         } else {
           await createAndPushNotif('conv_active', 'Conversación activa', `${msg.pushName || identifier}: "${(text || saved).substring(0, 60)}"`, { convId: contact.conversation_id, phone: identifier, name: msg.pushName || '' })
         }
 
-        // Agente de redirección: enviar resumen al asesor
-        if (isHandoff && summary) {
+        // Derivación especial: Planilla de Medidas confirmada
+        if (isPlanillaHandoff && summary) {
+          const clientName = msg.pushName || identifier
+          const planillaAdvisorMsg =
+            `📐 *NUEVA PLANILLA DE MEDIDAS DE OBRA*\n\n` +
+            `👤 *Cliente:* ${clientName}\n` +
+            `📱 *WhatsApp:* wa.me/+${identifier}\n\n` +
+            `${summary}\n\n` +
+            `⏰ ${new Date().toLocaleString('es-AR', { timeZone: 'America/Argentina/Buenos_Aires' })}`
+          try {
+            const targetAdvisorPhone = result.handoff_target || REDIRECT
+            const validPhone = String(targetAdvisorPhone).replace(/[^0-9]/g, '') || REDIRECT
+            await sock.sendMessage(`${validPhone}@s.whatsapp.net`, { text: planillaAdvisorMsg })
+            console.log(`[PLANILLA] Planilla enviada al asesor ${validPhone}`)
+          } catch (e) {
+            console.error('[PLANILLA] Error enviando planilla al asesor:', e.message)
+          }
+          await db.savePlanillaMedidas({
+            conv_id: contact.conversation_id,
+            contact_id: contact.id,
+            obra: clientName,
+            formatted_text: summary,
+            status: 'confirmada'
+          }).catch(err => console.error('[DB Planilla Error]:', err.message))
+
+          await createAndPushNotif('planilla_medidas', 'Planilla de Medidas confirmada', `${clientName} completó la planilla de relevamiento para producción`, { convId: contact.conversation_id, phone: identifier, name: clientName, summary, waLink: `https://wa.me/${identifier}` })
+        } else if (isHandoff && summary) {
+          // Derivación general a asesor
           const clientName = msg.pushName || identifier
           const imgLine = imageDescription ? `\n🖼️ *Imagen enviada por el cliente:* ${imageDescription}\n` : ''
           const adminMsg =
@@ -321,7 +399,7 @@ cron.schedule('*/5 * * * *', async () => {
       const result  = await getAIReply({ text: '', hasImage: false, imageBuffer: null, hasAudio: false, audioBuffer: null, history, clientName: conv.name || conv.phone, agentTypeOverride: 'recontacto' })
       if (result.reply && !result.isError) {
         const isLid = conv.phone.length >= 14 && !conv.phone.startsWith('549');
-        const targetJid = isLid ? `${conv.phone}@lid` : `${conv.phone}@s.whatsapp.net`
+        const targetJid = conv.jid || conv.contact_jid || (conv.phone.includes('@') ? conv.phone : (isLid ? `${conv.phone}@lid` : `${conv.phone}@s.whatsapp.net`))
         await activeSock.sendMessage(targetJid, { text: result.reply })
         await db.saveMessage(conv.conversation_id, 'ai', result.reply, 'recontacto')
         await db.setRecontactSent(conv.conversation_id)
@@ -768,12 +846,30 @@ Respondé en español rioplatense, mensajes cortos y claros. Sé amigable pero d
       const conv = await db.getConversationWithContact(convId)
       if (!conv) return json(res, { error: 'Conversación no encontrada' }, 404)
       const isLid = conv.phone.length >= 14 && !conv.phone.startsWith('549');
-      const targetJid = isLid ? `${conv.phone}@lid` : `${conv.phone}@s.whatsapp.net`
+      const targetJid = conv.jid || conv.contact_jid || (conv.phone.includes('@') ? conv.phone : (isLid ? `${conv.phone}@lid` : `${conv.phone}@s.whatsapp.net`))
       await activeSock.sendMessage(targetJid, { text: message.trim() })
-      await db.saveMessage(convId, 'human', message.trim(), 'human')
+      await db.saveMessage(convId, 'human', message.trim(), 'human', null, 'text')
       await db.logActivity(authUser.id, authUser.username, 'mensaje_manual', { convId, phone: conv.phone, preview: message.substring(0, 50) })
       await createAndPushNotif('human_msg', 'Mensaje manual enviado', `${authUser.name || authUser.username} → ${conv.name || conv.phone}: "${message.substring(0, 50)}"`, { convId, phone: conv.phone })
       return json(res, { ok: true })
+    } catch (err) { return json(res, { error: err.message }, 500) }
+  }
+
+  // ── Planillas de Medidas ──────────────────────────────────────────
+  // GET /api/planillas
+  if (url === '/api/planillas' && req.method === 'GET') {
+    try {
+      const planillas = await db.getPlanillasMedidas(50)
+      return json(res, { planillas })
+    } catch (err) { return json(res, { error: err.message }, 500) }
+  }
+
+  // GET /api/conversations/:id/planilla
+  const convPlanillaMatch = url.match(/^\/api\/conversations\/(\d+)\/planilla$/)
+  if (convPlanillaMatch && req.method === 'GET') {
+    try {
+      const planilla = await db.getPlanillaByConvId(parseInt(convPlanillaMatch[1]))
+      return json(res, { planilla })
     } catch (err) { return json(res, { error: err.message }, 500) }
   }
 

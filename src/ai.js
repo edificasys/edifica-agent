@@ -10,7 +10,7 @@ const groq = new Groq({ apiKey: process.env.GROQ_API_KEY })
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY)
 
 // ── Detección de tipo de agente (sin API call extra) ─────────────
-function detectAgentType(text, settings) {
+function detectAgentType(text, settings, history = []) {
   const t = (text || '').toLowerCase()
 
   if (settings?.custom_agents && Array.isArray(settings.custom_agents)) {
@@ -26,6 +26,20 @@ function detectAgentType(text, settings) {
   // Redirección — máxima prioridad
   if (/hablar con (un |una )?(persona|asesor|humano|alguien|vendedor|representante)|quiero (ser |)atendid|me comunic[ae]|derivame|pasame|un asesor|necesito (que me llamen|hablar con alguien)|llamarme|hablen conmigo|quiero contactarme/.test(t))
     return 'redireccion'
+
+  // Planilla de medidas / Relevamiento de obra
+  if (/planilla|relevamiento|medida|medidas|vano\b|vanos\b|mil[ií]metros|\bmm\b|ancho.*alto|alto.*ancho|profundidad.*vano|sentido de apertura|apertura.*(izq|der)|puerta a medida|abertura a medida/.test(t))
+    return 'medidas'
+
+  // Continuidad de conversación: Si el último mensaje del bot era del agente 'medidas' y el usuario continúa relevando o confirmando
+  if (Array.isArray(history) && history.length > 0) {
+    const lastBotMsg = [...history].reverse().find(m => m.sender === 'ai')
+    if (lastBotMsg && lastBotMsg.agent_type === 'medidas') {
+      if (!/reforma|remodelar|impermeabiliz|gotera|humedad|pintura|albañil|mueble|sillón|cocina|escalera/.test(t)) {
+        return 'medidas'
+      }
+    }
+  }
 
   // Productos y marcas
   if (/piatti|portón|abertura|ventana|puerta (de aluminio|de pvc|levadiza)|pvc|aluminio|liv\b|sill[oó]n|silla|mesa (de )?comedor|mueble|mobiliario|interia|cocina (a medida|dise[ñn])|vestidor|closet|escalera|madera|vidrio/.test(t))
@@ -44,7 +58,7 @@ function detectAgentType(text, settings) {
 
 // ── Prompts especializados por agente ────────────────────────────
 const SIZES_CONTEXT = `
-⚠️ MEDIDAS: Todos los productos que mostramos son en medidas ESTÁNDAR de fábrica. Si el cliente pide medidas diferentes o modificaciones: 1) Mencioná las medidas estándar disponibles, 2) Si insiste en medidas personalizadas, informale que es posible pero requiere una visita o consulta con el asesor, 3) Invitalo al showroom (Mauricio Yadarola 795, Córdoba, L-V 9-18hs) o derivalo con el asesor para concretar.`
+⚠️ MEDIDAS: Todos los productos que mostramos son en medidas ESTÁNDAR de fábrica. Si el cliente pide medidas diferentes o modificaciones: 1) Mencioná las medidas estándar disponibles, 2) Si insiste en medidas personalizadas, informale que podemos completar la Planilla de Medidas de obra para enviar a producción o coordinar una visita con el asesor, 3) Invitalo al showroom (Mauricio Yadarola 795, Córdoba, L-V 9-18hs) o derivalo con el asesor para concretar.`
 
 const AGENT_PROMPTS = {
   generalista: `Sos EDY, asistente de EDIFICA Obras y Servicios (Córdoba, Argentina). Respondé saludos, preguntas generales y orientá al cliente hacia el servicio o producto correcto. Si el cliente no sabe bien qué necesita, hacé una pregunta para entender mejor. Sé breve, cálido y en argentino.${SIZES_CONTEXT}`,
@@ -54,6 +68,55 @@ const AGENT_PROMPTS = {
   productos: `Sos el asesor de productos de EDIFICA. Manejás las marcas: PIATTI (aberturas PVC y aluminio, portones levadizos — distribuidor oficial con garantía de fábrica), LIV (mobiliario: sillones, sillas, comedor), INTERIA (cocinas y vestidores a medida), Escaleras a Medida (madera, metal y vidrio). Para productos físicos, invitá siempre a visitar el showroom en Mauricio Yadarola 795, Córdoba (L-V 9-18hs) o pedir catálogo por WhatsApp. Cuando el cliente pida imágenes o fotos, describí brevemente el producto y decile que "a continuación te muestro una imagen" — el sistema la envía automáticamente. NUNCA uses frases como [envía fotos], [enviando imagen], [ver fotos] ni ninguna acción entre corchetes. NUNCA simules enviar archivos.${SIZES_CONTEXT}`,
 
   cotizacion: `Sos el agente de cotizaciones de EDIFICA. Tu objetivo es capturar la consulta del cliente para que un asesor pueda contactarlo con un presupuesto a medida. Preguntá: qué necesita, en qué zona está, cuándo quiere iniciar. Al final siempre ofrecé: "Te contactamos en las próximas horas para darte una cotización exacta. ¿Querés dejarnos tus datos o preferís escribirnos a contactanos@edifica.com?". También podés dar rangos orientativos si los tenés.${SIZES_CONTEXT}`,
+
+  medidas: `Sos el Agente Especialista en Relevamiento y Planilla de Medidas de EDIFICA EQUIPAMIENTOS (Córdoba, Argentina).
+Tu objetivo es relevar las medidas de vano de la obra del cliente y generar la "PLANILLA DE MEDIDAS - Relevamiento de obra" oficial para enviar a producción y cotización.
+
+PASO A PASO:
+1. DATOS DE OBRA:
+   Si no los tenés en el historial o el cliente no los dijo, pedí amablemente:
+   - Nombre de la obra / cliente (ej: Gabriel Sánchez)
+   - Dirección de la obra (ej: V. Prado, Córdoba)
+
+2. DATOS DE LOS VANOS (EN MILÍMETROS mm):
+   Pedí las medidas de cada abertura o vano que necesita presupuestar o fabricar:
+   - Vano / Ambiente: (ej: Baño, Dormitorio Principal, Cocina, etc.)
+   - Alto (mm) (ej: 2020 mm)
+   - Ancho (mm) (ej: 800 mm)
+   - Profundidad / Espesor del muro (mm) (ej: 190 mm)
+   - Sentido de apertura: ¿Abre hacia la IZQUIERDA (IZQ.) o hacia la DERECHA (DER.)?
+
+3. GENERACIÓN DE LA PLANILLA:
+   Apenas el cliente te brinde las medidas (de uno o varios vanos), generá y mostrá la PLANILLA DE MEDIDAS estructurada con este formato exacto:
+
+📋 *EDIFICA EQUIPAMIENTOS — PLANILLA DE MEDIDAS*
+*Relevamiento de obra — Registro simple para producción*
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+🏗️ *OBRA:* [Nombre de Obra / Cliente]
+📍 *DIRECCIÓN:* [Dirección]
+📅 *FECHA:* [Fecha actual DD/MM/AAAA]
+👤 *RELEVÓ:* [Nombre del cliente / relevador]
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+📐 *MEDIDAS DE VANO (en mm):*
+
+01 | [VANO / AMBIENTE]
+• Medidas: [ALTO] mm (alto) × [ANCHO] mm (ancho) × [PROFUNDIDAD] mm (prof.)
+• Sentido de apertura: [IZQ. ◀️ / DER. ▶️]
+
+(Repetir 02, 03... por cada vano relevado)
+
+📝 *OBSERVACIONES:* [Detalles constructivos relevantes o "Ninguna"]
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+¿Está todo correcto con estas medidas y sentidos de apertura, o querés modificar algún dato?
+
+4. SI EL CLIENTE PIDE MODIFICAR:
+   Ajustá el vano o dato indicado y volvé a mostrar la planilla actualizada pidiendo confirmación.
+
+5. SI EL CLIENTE CONFIRMA (ej: "sí", "correcto", "está bien", "perfecto", "confirmado", "dale", "avanzá"):
+   Decile que ya registraste la planilla y que se la derivaste al Asesor Técnico para cotización exacta:
+   "¡Excelente! Tu Planilla de Medidas ya quedó registrada y se la envié a nuestro Asesor Técnico 👇
+   https://wa.me/543516002716
+   El asesor ya tiene todas las medidas relevadas para armarte la cotización exacta y coordinar con producción. ¡Muchas gracias!"`,
 
   redireccion: `Sos el agente de derivación de EDIFICA. El cliente quiere hablar con un asesor humano. Tu respuesta debe: 1) Agradecerle por su consulta, 2) Dar el link de WhatsApp del asesor: https://wa.me/543516002716, 3) Decirle que el asesor ya tiene el resumen de su consulta y lo va a atender rápido. Sé cálido y breve.`,
 
@@ -209,14 +272,16 @@ export async function getAIReply({ text, hasImage, imageBuffer, hasAudio, audioB
     const transcribed = await transcribeAudio(audioBuffer, audioMime)
     if (!transcribed) return {
       reply: 'Recibí tu audio pero no pude escucharlo bien. ¿Podés escribirme lo que necesitás?',
-      agentType: 'generalista', isHandoff: false, summary: null
+      agentType: 'generalista', isHandoff: false, summary: null, transcribedText: null
     }
     console.log(`[Whisper] "${transcribed.substring(0, 80)}"`)
-    return getAIReply({ text: transcribed, hasImage: false, imageBuffer: null, history, clientName, imagesSent })
+    const aiRes = await getAIReply({ text: transcribed, hasImage: false, imageBuffer: null, history, clientName, imagesSent })
+    aiRes.transcribedText = transcribed
+    return aiRes
   }
 
   // Detectar tipo de agente
-  const agentType = agentTypeOverride || detectAgentType(text, settings)
+  const agentType = agentTypeOverride || detectAgentType(text, settings, history)
   const isHandoff = agentType === 'redireccion'
 
   // Imagen del cliente → Gemini analiza y describe
@@ -308,39 +373,66 @@ ${settings.personality_prompt ? settings.personality_prompt : 'Sé muy breve y c
 ${settings.restrictions ? `PROHIBIDO ESTRICTAMENTE: ${settings.restrictions}` : ''}
 TU RESPUESTA NO DEBE SUPERAR BAJO NINGÚN CONCEPTO LAS 3 LÍNEAS DE TEXTO. No hagas listas largas ni mandes párrafos grandes de texto. Respondé la consulta de forma útil pero extremadamente corta.]`
 
-    if (isFirstMessage && settings.welcome_message) {
+    if (agentType === 'medidas') {
+      messages[messages.length - 1].content += `\n\n[SISTEMA: Estás actuando como Agente de Planilla de Medidas. Si el cliente dio medidas o datos de obra, mostrá la PLANILLA DE MEDIDAS completa, estructurada y limpia con todos sus campos (Alto, Ancho, Profundidad en mm y Sentido de Apertura). No apliques la regla de 3 líneas y pedí confirmación al final.]`
+    } else if (isFirstMessage && settings.welcome_message) {
       messages[messages.length - 1].content += `\n\n[SISTEMA: Este es el primer contacto del cliente. DEBES iniciar tu respuesta saludando EXACTAMENTE con este mensaje de bienvenida: "${settings.welcome_message}". Luego responde su consulta respetando la regla estricta de no superar las 3 líneas.]`
     } else {
       messages[messages.length - 1].content += reinforcement
     }
+
+    const maxTokens = agentType === 'medidas' ? 650 : 200
+
     let response;
     try {
       response = await groq.chat.completions.create({
         model: 'llama-3.3-70b-versatile',
         messages,
-        max_tokens: 200,
-        temperature: 0.5,
+        max_tokens: maxTokens,
+        temperature: agentType === 'medidas' ? 0.3 : 0.5,
       })
     } catch (e) {
       if (e.status === 429) {
         response = await groq.chat.completions.create({
           model: 'llama-3.1-8b-instant',
           messages,
-          max_tokens: 200,
-          temperature: 0.5,
+          max_tokens: maxTokens,
+          temperature: agentType === 'medidas' ? 0.3 : 0.5,
         })
       } else throw e;
     }
     let reply = response.choices[0].message.content
 
-    // Limpiar cualquier tag residual entre corchetes
-    reply = reply.replace(/\[[^\]]{0,60}\]/g, '').trim()
+    // Limpiar cualquier tag residual entre corchetes (pero no corchetes de texto informativo)
+    reply = reply.replace(/\[(?:envía|enviando|ver|foto|audio)[^\]]*\]/gi, '').trim()
 
     // Detectar si el cliente pide imágenes
     const wantsImage = /foto|imagen|photo|picture|ver|mostrar|tenés foto|mandame|como queda|como se ve/i.test(text || '')
     const imageInfo = wantsImage ? await findProductImage(text, agentType) : null
 
-    return { reply, agentType, isHandoff: false, summary: null, imageInfo }
+    // Detección de confirmación en el agente de medidas para derivación a asesor
+    let isPlanillaHandoff = false
+    let planillaSummary = null
+    if (agentType === 'medidas') {
+      const confirmsPlanilla = (/wa\.me\/|registrad|envié|deriv|producción/i.test(reply) && /(asesor|planilla)/i.test(reply)) ||
+        (/PLANILLA DE MEDIDAS/i.test(history.map(m => m.content || '').join(' ')) && /^(s[ií]|correcto|est[aá] bien|perfecto|confirmado|dale|avanz[aá]|mandalo|pasalo)$/i.test((text || '').trim()))
+
+      if (confirmsPlanilla) {
+        isPlanillaHandoff = true
+        const allText = [...history.map(m => m.content || ''), reply].join('\n\n')
+        const match = allText.match(/📋[\s\S]*?(?=¿Está todo correcto|¡Excelente|https:\/\/wa\.me|$)/i)
+        planillaSummary = match ? match[0].trim() : reply
+      }
+    }
+
+    return {
+      reply,
+      agentType,
+      isHandoff: isPlanillaHandoff,
+      isPlanillaHandoff,
+      summary: planillaSummary,
+      imageInfo
+    }
   } catch (err) {
     console.error('Error Groq:', err.message)
     return { reply: 'Disculpá, tuve un problema técnico. Intentá de nuevo en un momento.', agentType, isHandoff: false, summary: null, imageInfo: null, isError: true }

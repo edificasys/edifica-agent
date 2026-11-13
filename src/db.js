@@ -61,13 +61,37 @@ async function runMigrations() {
         ADD COLUMN IF NOT EXISTS recontact_sent BOOLEAN DEFAULT false,
         ADD COLUMN IF NOT EXISTS recontact_min  INTEGER DEFAULT 60,
         ADD COLUMN IF NOT EXISTS images_sent    JSONB   DEFAULT '{}',
-        ADD COLUMN IF NOT EXISTS bot_paused     BOOLEAN DEFAULT false
+        ADD COLUMN IF NOT EXISTS bot_paused     BOOLEAN DEFAULT false,
+        ADD COLUMN IF NOT EXISTS jid            TEXT
+    `)
+    await pool.query(`
+      ALTER TABLE contacts ADD COLUMN IF NOT EXISTS jid TEXT
     `)
     await pool.query(`
       ALTER TABLE messages ADD COLUMN IF NOT EXISTS media_url TEXT
     `)
     await pool.query(`
       ALTER TABLE messages DROP CONSTRAINT IF EXISTS messages_sender_check
+    `)
+    await pool.query(`
+      ALTER TABLE messages DROP CONSTRAINT IF EXISTS messages_type_check
+    `)
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS planillas_medidas (
+        id              SERIAL PRIMARY KEY,
+        conversation_id INTEGER REFERENCES conversations(id) ON DELETE CASCADE,
+        contact_id      INTEGER REFERENCES contacts(id) ON DELETE SET NULL,
+        obra            VARCHAR(200),
+        direccion       VARCHAR(255),
+        fecha           DATE DEFAULT CURRENT_DATE,
+        relevo          VARCHAR(100),
+        vanos           JSONB DEFAULT '[]',
+        observaciones   TEXT,
+        formatted_text  TEXT,
+        status          VARCHAR(50) DEFAULT 'pendiente',
+        created_at      TIMESTAMPTZ DEFAULT NOW(),
+        updated_at      TIMESTAMPTZ DEFAULT NOW()
+      )
     `)
     await pool.query(`
       CREATE TABLE IF NOT EXISTS appointments (
@@ -116,39 +140,43 @@ export function verifyPassword(password, stored) {
 
 export const db = {
   // ── WhatsApp ──────────────────────────────────────────────────────
-  async upsertContact(phone, name) {
+  async upsertContact(phone, name, jid = null) {
     const { rows } = await pool.query(`
-      INSERT INTO contacts (phone, name, last_contact_at)
-      VALUES ($1, $2, NOW())
+      INSERT INTO contacts (phone, name, jid, last_contact_at)
+      VALUES ($1, $2, $3, NOW())
       ON CONFLICT (phone) DO UPDATE
         SET last_contact_at = NOW(),
-            name = COALESCE($2, contacts.name)
+            name = COALESCE($2, contacts.name),
+            jid = COALESCE($3, contacts.jid)
       RETURNING *
-    `, [phone, name])
+    `, [phone, name, jid])
 
     const contact = rows[0]
 
     let conv = await pool.query(
-      'SELECT id FROM conversations WHERE contact_id = $1 ORDER BY last_message_at DESC LIMIT 1',
+      'SELECT id, jid FROM conversations WHERE contact_id = $1 ORDER BY last_message_at DESC LIMIT 1',
       [contact.id]
     )
 
     if (conv.rows.length === 0) {
       conv = await pool.query(
-        'INSERT INTO conversations (contact_id) VALUES ($1) RETURNING *',
-        [contact.id]
+        'INSERT INTO conversations (contact_id, jid) VALUES ($1, $2) RETURNING *',
+        [contact.id, jid]
       )
+    } else if (jid && !conv.rows[0].jid) {
+      await pool.query('UPDATE conversations SET jid = $1 WHERE id = $2', [jid, conv.rows[0].id])
     }
 
     contact.conversation_id = conv.rows[0].id
+    contact.jid = jid || conv.rows[0]?.jid
     return contact
   },
 
-  async saveMessage(conversationId, sender, content, agentType = 'generalista', mediaUrl = null) {
+  async saveMessage(conversationId, sender, content, agentType = 'generalista', mediaUrl = null, type = 'text') {
     await pool.query(`
       INSERT INTO messages (conversation_id, sender, type, content, agent_type, media_url)
-      VALUES ($1, $2, 'text', $3, $4, $5)
-    `, [conversationId, sender, content, agentType, mediaUrl])
+      VALUES ($1, $2, $3, $4, $5, $6)
+    `, [conversationId, sender, type || 'text', content, agentType, mediaUrl])
 
     await pool.query(
       'UPDATE conversations SET last_message_at = NOW() WHERE id = $1',
@@ -515,8 +543,8 @@ export const db = {
   // ── Conversation helpers ──────────────────────────────────────────
   async getConversationWithContact(convId) {
     const { rows } = await pool.query(`
-      SELECT conv.id, conv.last_message_at, conv.recontact_min, conv.bot_paused,
-             c.phone, c.name
+      SELECT conv.id, conv.last_message_at, conv.recontact_min, conv.bot_paused, conv.jid,
+             c.phone, c.name, c.jid as contact_jid
       FROM conversations conv
       JOIN contacts c ON c.id = conv.contact_id
       WHERE conv.id = $1
@@ -526,8 +554,8 @@ export const db = {
 
   async getConversationsForRecontact() {
     const { rows } = await pool.query(`
-      SELECT conv.id AS conversation_id, COALESCE(conv.recontact_min, 60) AS recontact_min,
-             c.phone, c.name,
+      SELECT conv.id AS conversation_id, conv.jid, COALESCE(conv.recontact_min, 60) AS recontact_min,
+             c.phone, c.name, c.jid as contact_jid,
              conv.last_message_at
       FROM conversations conv
       JOIN contacts c ON c.id = conv.contact_id
@@ -624,5 +652,38 @@ export const db = {
 
   async deleteAppointment(id) {
     await pool.query(`UPDATE appointments SET status = 'cancelado', updated_at = NOW() WHERE id = $1`, [id])
+  },
+
+  // ── Planillas de Medidas (EDIFICA) ──────────────────────────────
+  async savePlanillaMedidas({ conv_id, contact_id, obra, direccion, fecha, relevo, vanos = [], observaciones = '', formatted_text = '', status = 'confirmada' }) {
+    const { rows } = await pool.query(`
+      INSERT INTO planillas_medidas (conversation_id, contact_id, obra, direccion, fecha, relevo, vanos, observaciones, formatted_text, status, updated_at)
+      VALUES ($1, $2, $3, $4, COALESCE($5, CURRENT_DATE), $6, $7, $8, $9, $10, NOW())
+      RETURNING *
+    `, [conv_id || null, contact_id || null, obra || null, direccion || null, fecha || null, relevo || null, JSON.stringify(vanos), observaciones || null, formatted_text || null, status])
+    return rows[0]
+  },
+
+  async getPlanillasMedidas(limit = 50) {
+    const { rows } = await pool.query(`
+      SELECT pm.*, c.name AS contact_name, c.phone AS contact_phone
+      FROM planillas_medidas pm
+      LEFT JOIN contacts c ON c.id = pm.contact_id
+      ORDER BY pm.created_at DESC
+      LIMIT $1
+    `, [limit])
+    return rows
+  },
+
+  async getPlanillaByConvId(convId) {
+    const { rows } = await pool.query(`
+      SELECT pm.*, c.name AS contact_name, c.phone AS contact_phone
+      FROM planillas_medidas pm
+      LEFT JOIN contacts c ON c.id = pm.contact_id
+      WHERE pm.conversation_id = $1
+      ORDER BY pm.created_at DESC
+      LIMIT 1
+    `, [convId])
+    return rows[0] || null
   },
 }
