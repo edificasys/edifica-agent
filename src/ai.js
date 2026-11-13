@@ -7,37 +7,130 @@ import { tmpdir } from 'os'
 import { join } from 'path'
 import { db } from './db.js'
 
-const groq = new Groq({ apiKey: process.env.GROQ_API_KEY })
-const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY)
+const groqApiKey = (process.env.GROQ_API_KEY || '').trim().replace(/^["']|["']$/g, '')
+const geminiApiKey = (process.env.GEMINI_API_KEY || '').trim().replace(/^["']|["']$/g, '')
 
-// ── Modelos de Groq con fallback automático para evitar 404 / 429 ─
-const FALLBACK_MODELS = [
-  'llama-3.1-8b-instant',
-  'llama-3.3-70b-versatile',
-  'llama-3.1-70b-versatile',
-  'llama3-70b-8192',
-  'llama3-8b-8192',
-  'mixtral-8x7b-32768'
-]
+const groq = new Groq({ apiKey: groqApiKey })
+const genAI = new GoogleGenerativeAI(geminiApiKey)
 
-async function createGroqChat(messages, max_tokens = 300, temperature = 0.5) {
-  let lastErr = null
-  for (const model of FALLBACK_MODELS) {
+// ── Fallback a Google Gemini (infalible si Groq falla o no tiene modelos) ─
+async function callGeminiChat(messages, max_tokens = 300, temperature = 0.5) {
+  if (!geminiApiKey) {
+    throw new Error('GEMINI_API_KEY no configurada')
+  }
+  const systemMsg = messages.find(m => m.role === 'system')?.content || ''
+  const historyText = messages
+    .filter(m => m.role !== 'system')
+    .map(m => `${m.role === 'assistant' ? 'Asistente' : 'Usuario'}: ${m.content}`)
+    .join('\n')
+
+  const prompt = `${systemMsg ? `INSTRUCCIONES DEL SISTEMA:\n${systemMsg}\n\n` : ''}HISTORIAL Y MENSAJES:\n${historyText}\n\nAsistente:`
+
+  const geminiModels = ['gemini-1.5-flash-latest', 'gemini-1.5-flash', 'gemini-2.0-flash', 'gemini-1.5-pro-latest']
+  for (const m of geminiModels) {
     try {
-      const response = await groq.chat.completions.create({
-        model,
-        messages,
-        max_tokens,
-        temperature,
+      const model = genAI.getGenerativeModel({
+        model: m,
+        generationConfig: { maxOutputTokens: max_tokens, temperature }
       })
-      return response
+      const result = await model.generateContent(prompt)
+      const text = result.response.text().trim()
+      console.log(`[Gemini Fallback Exitoso] Respondido usando ${m}`)
+      return { choices: [{ message: { content: text } }] }
     } catch (err) {
-      lastErr = err
-      console.warn(`[Groq Fallback] Modelo "${model}" falló (${err.status || err.message}). Probando siguiente...`)
-      if (err.status === 401) throw err // Error de API key
+      console.warn(`[Gemini Fallback] Modelo ${m} falló:`, err.message)
     }
   }
-  throw lastErr
+  throw new Error('Todos los modelos de Gemini fallaron')
+}
+
+// ── Detección dinámica de modelos activos de Groq ────────────────
+let cachedGroqModels = null
+let lastGroqModelFetch = 0
+
+async function getActiveGroqModels() {
+  const now = Date.now()
+  if (cachedGroqModels && (now - lastGroqModelFetch < 3600000)) {
+    return cachedGroqModels
+  }
+  try {
+    const list = await groq.models.list()
+    if (list?.data && Array.isArray(list.data)) {
+      cachedGroqModels = list.data
+        .map(m => m.id)
+        .filter(id =>
+          !id.includes('whisper') &&
+          !id.includes('guard') &&
+          !id.includes('safeguard') &&
+          !id.includes('vision') &&
+          !id.includes('mixtral') &&
+          !id.includes('8192')
+        )
+      lastGroqModelFetch = now
+      console.log(`[Groq] Modelos activos detectados en tu cuenta (${cachedGroqModels.length}):`, cachedGroqModels.join(', '))
+      return cachedGroqModels
+    }
+  } catch (err) {
+    console.warn('[Groq] Error listando modelos activos:', err.message)
+  }
+  return []
+}
+
+// ── Invocación con Dual-Engine: Groq + Gemini Fallback ────────────
+export async function createGroqChat(messages, max_tokens = 300, temperature = 0.5) {
+  let lastGroqErr = null
+
+  // 1. Probar modelos de Groq (dinámicos + priorizados activos)
+  if (groqApiKey) {
+    const dynamicModels = await getActiveGroqModels().catch(() => [])
+
+    const priorityList = [
+      'gemma2-9b-it',
+      'llama-3.3-70b-versatile',
+      'llama-3.1-8b-instant',
+      'deepseek-r1-distill-llama-70b',
+      'qwen-2.5-coder-32b',
+      'llama-3.2-3b-preview',
+      'llama-3.2-1b-preview',
+      'llama-3.2-11b-text-preview'
+    ]
+
+    let modelsToTry = []
+    if (dynamicModels.length > 0) {
+      modelsToTry = [
+        ...priorityList.filter(m => dynamicModels.includes(m)),
+        ...dynamicModels.filter(m => !priorityList.includes(m))
+      ]
+    } else {
+      modelsToTry = priorityList
+    }
+    modelsToTry = [...new Set(modelsToTry)]
+
+    for (const model of modelsToTry) {
+      try {
+        const response = await groq.chat.completions.create({
+          model,
+          messages,
+          max_tokens,
+          temperature,
+        })
+        return response
+      } catch (err) {
+        lastGroqErr = err
+        const isDecommissioned = err.message?.includes('decommissioned') || err.error?.code === 'model_decommissioned'
+        console.warn(`[Groq Fallback] Modelo "${model}" falló (${err.status || err.message})${isDecommissioned ? ' [DECOMMISSIONED]' : ''}. Probando siguiente...`)
+      }
+    }
+  }
+
+  // 2. Si Groq falló completamente o no tiene modelos disponibles, activar Google Gemini
+  console.log('[AI Fallback] Activando motor Google Gemini de respaldo...')
+  try {
+    return await callGeminiChat(messages, max_tokens, temperature)
+  } catch (geminiErr) {
+    console.error('[AI Fallback] Google Gemini también falló:', geminiErr.message)
+    throw (lastGroqErr || geminiErr)
+  }
 }
 
 // ── Obtener información dinámica de asesores (Mi Negocio) ────────

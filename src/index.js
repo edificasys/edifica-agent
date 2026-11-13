@@ -9,7 +9,7 @@ import fs from 'fs'
 import Groq from 'groq-sdk'
 import { put } from '@vercel/blob'
 import { db } from './db.js'
-import { getAIReply, getAdvisorInfo } from './ai.js'
+import { getAIReply, getAdvisorInfo, createGroqChat } from './ai.js'
 import { sendAdminAlert, setAdminSocket } from './alerts.js'
 
 dotenv.config()
@@ -518,28 +518,13 @@ Ayudás a los usuarios del sistema (administradores y asesores) a:
 
 Respondé en español rioplatense, mensajes cortos y claros. Sé amigable pero directo. Si el problema es técnico y complejo, decí honestamente qué podés y qué no podés resolver remotamente.`
 
-      const groq = new Groq({ apiKey: process.env.GROQ_API_KEY })
+      // EDY assistant using createGroqChat (Groq + Gemini fallback)
       const messages = [
         { role: 'system', content: SYSTEM },
         ...history.slice(-6).map(m => ({ role: m.role, content: m.content || m.text || '' })),
         { role: 'user', content: message }
       ]
-      let r = null;
-      const modelsToTry = ['llama-3.1-8b-instant', 'llama-3.3-70b-versatile', 'llama-3.1-70b-versatile', 'llama3-8b-8192']
-      for (const m of modelsToTry) {
-        try {
-          r = await groq.chat.completions.create({
-            model: m,
-            messages,
-            max_tokens: 250,
-            temperature: 0.5,
-          })
-          break
-        } catch (e) {
-          if (e.status === 401) throw e
-        }
-      }
-      if (!r) throw new Error('Todos los modelos de Groq fallaron')
+      const r = await createGroqChat(messages, 250, 0.5)
       return json(res, { reply: r.choices[0].message.content })
     } catch (err) {
       console.error('[Assistant]', err.message)
