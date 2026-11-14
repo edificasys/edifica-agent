@@ -18,7 +18,9 @@ async function runMigrations() {
         ADD COLUMN IF NOT EXISTS custom_agents    JSONB         DEFAULT '[]',
         ADD COLUMN IF NOT EXISTS agent_overrides  JSONB         DEFAULT '{}',
         ADD COLUMN IF NOT EXISTS business_name    VARCHAR(100),
-        ADD COLUMN IF NOT EXISTS business_logo    TEXT
+        ADD COLUMN IF NOT EXISTS business_logo    TEXT,
+        ADD COLUMN IF NOT EXISTS recontact_enabled BOOLEAN       DEFAULT false,
+        ADD COLUMN IF NOT EXISTS last_advisor_index INTEGER      DEFAULT 0
     `)
     await pool.query(`
       CREATE TABLE IF NOT EXISTS users (
@@ -93,6 +95,13 @@ async function runMigrations() {
         updated_at      TIMESTAMPTZ DEFAULT NOW()
       )
     `)
+    await pool.query(`
+      ALTER TABLE planillas_medidas ADD COLUMN IF NOT EXISTS pdf_base64 TEXT
+    `)
+    // Marcar conversaciones antiguas como recontactadas para que el bot nunca envíe mensajes no solicitados a contactos viejos
+    await pool.query(`
+      UPDATE conversations SET recontact_sent = true WHERE recontact_sent IS NULL OR recontact_sent = false
+    `).catch(() => {})
     await pool.query(`
       CREATE TABLE IF NOT EXISTS appointments (
         id          SERIAL PRIMARY KEY,
@@ -561,6 +570,12 @@ export const db = {
       JOIN contacts c ON c.id = conv.contact_id
       WHERE COALESCE(conv.recontact_sent, false) = false
         AND conv.last_message_at IS NOT NULL
+        AND conv.last_message_at > NOW() - INTERVAL '7 days'
+        AND c.phone NOT LIKE '%@broadcast%'
+        AND c.phone NOT LIKE '%@g.us%'
+        AND c.phone NOT LIKE '%@newsletter%'
+        AND c.phone != 'status@broadcast'
+        AND (conv.jid IS NULL OR (conv.jid NOT LIKE '%@broadcast%' AND conv.jid NOT LIKE '%@g.us%' AND conv.jid NOT LIKE '%@newsletter%'))
         AND (SELECT sender FROM messages WHERE conversation_id = conv.id ORDER BY created_at DESC LIMIT 1) = 'ai'
         AND conv.last_message_at < NOW() - (COALESCE(conv.recontact_min, 60)::text || ' minutes')::INTERVAL
     `)
@@ -655,13 +670,62 @@ export const db = {
   },
 
   // ── Planillas de Medidas (EDIFICA) ──────────────────────────────
-  async savePlanillaMedidas({ conv_id, contact_id, obra, direccion, fecha, relevo, vanos = [], observaciones = '', formatted_text = '', status = 'confirmada' }) {
+  async savePlanillaMedidas({ conv_id, contact_id, obra, direccion, fecha, relevo, vanos = [], observaciones = '', formatted_text = '', pdf_base64 = null, status = 'confirmada' }) {
     const { rows } = await pool.query(`
-      INSERT INTO planillas_medidas (conversation_id, contact_id, obra, direccion, fecha, relevo, vanos, observaciones, formatted_text, status, updated_at)
-      VALUES ($1, $2, $3, $4, COALESCE($5, CURRENT_DATE), $6, $7, $8, $9, $10, NOW())
+      INSERT INTO planillas_medidas (conversation_id, contact_id, obra, direccion, fecha, relevo, vanos, observaciones, formatted_text, pdf_base64, status, updated_at)
+      VALUES ($1, $2, $3, $4, COALESCE($5, CURRENT_DATE), $6, $7, $8, $9, $10, $11, NOW())
       RETURNING *
-    `, [conv_id || null, contact_id || null, obra || null, direccion || null, fecha || null, relevo || null, JSON.stringify(vanos), observaciones || null, formatted_text || null, status])
+    `, [conv_id || null, contact_id || null, obra || null, direccion || null, fecha || null, relevo || null, JSON.stringify(vanos), observaciones || null, formatted_text || null, pdf_base64 || null, status])
     return rows[0]
+  },
+
+  // ── Rotación Round-Robin de Asesores (Mi Negocio) ───────────────
+  async getNextRotatedAdvisor(settings, preference = null) {
+    const advisors = Array.isArray(settings?.advisors) ? settings.advisors.filter(a => a.phone && String(a.phone).trim()) : []
+
+    if (advisors.length === 0) {
+      const fallback = settings?.redirect_phone || settings?.admin_phone || process.env.REDIRECT_PHONE || process.env.ADMIN_PHONE || ''
+      const clean = String(fallback).replace(/[^0-9]/g, '')
+      return {
+        name: 'Asesor',
+        phone: clean,
+        role: 'General',
+        link: clean ? `https://wa.me/${clean}` : ''
+      }
+    }
+
+    if (advisors.length === 1) {
+      const a = advisors[0]
+      const clean = String(a.phone).replace(/[^0-9]/g, '')
+      return {
+        name: a.name || 'Asesor',
+        phone: clean,
+        role: a.role || 'General',
+        link: clean ? `https://wa.me/${clean}` : ''
+      }
+    }
+
+    // Rotación atómica en la base de datos para distribuir 1 por 1
+    let chosenIdx = 0
+    try {
+      const { rows } = await pool.query(`
+        UPDATE ai_settings
+        SET last_advisor_index = (COALESCE(last_advisor_index, 0) + 1) % $1
+        RETURNING last_advisor_index
+      `, [advisors.length])
+      chosenIdx = (rows[0]?.last_advisor_index !== undefined) ? rows[0].last_advisor_index : 0
+    } catch {
+      chosenIdx = Math.floor(Math.random() * advisors.length)
+    }
+
+    const chosen = advisors[chosenIdx % advisors.length]
+    const clean = String(chosen.phone).replace(/[^0-9]/g, '')
+    return {
+      name: chosen.name || 'Asesor',
+      phone: clean,
+      role: chosen.role || 'General',
+      link: clean ? `https://wa.me/${clean}` : ''
+    }
   },
 
   async getPlanillasMedidas(limit = 50) {
@@ -685,5 +749,16 @@ export const db = {
       LIMIT 1
     `, [convId])
     return rows[0] || null
+  },
+
+  async getPlanillaById(id) {
+    const { rows } = await pool.query(`SELECT * FROM planillas_medidas WHERE id = $1`, [id])
+    return rows[0] || null
+  },
+
+  async deleteConversation(convId) {
+    await pool.query(`DELETE FROM messages WHERE conversation_id = $1`, [convId])
+    const { rowCount } = await pool.query(`DELETE FROM conversations WHERE id = $1`, [convId])
+    return rowCount > 0
   },
 }

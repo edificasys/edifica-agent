@@ -202,12 +202,18 @@ function detectAgentType(text, settings, history = []) {
   if (/planilla|relevamiento|medida|medidas|vano\b|vanos\b|mil[ií]metros|\bmm\b|ancho.*alto|alto.*ancho|profundidad.*vano|sentido de apertura|apertura.*(izq|der)|puerta a medida|abertura a medida/.test(t))
     return 'medidas'
 
-  // Continuidad de conversación: Si el último mensaje del bot era del agente 'medidas' y el usuario continúa relevando o confirmando
+  // Continuidad de conversación: Si el historial tiene una planilla de medidas en curso
   if (Array.isArray(history) && history.length > 0) {
-    const lastBotMsg = [...history].reverse().find(m => m.sender === 'ai')
-    if (lastBotMsg && lastBotMsg.agent_type === 'medidas') {
-      if (!/reforma|remodelar|impermeabiliz|gotera|humedad|pintura|albañil|mueble|sillón|cocina|escalera/.test(t)) {
+    const hasPlanilla = history.some(m => /PLANILLA DE MEDIDAS|Medidas de vano|vano\/ambiente/i.test(m.content || ''))
+    if (hasPlanilla) {
+      if (/bien|correct|perfect|confirm|dale|avanz|direcci[oó]n|pehuaj[oó]|calle|visita|coordin|anot|pas[ao]|mand|modific|cambi|medid|vano|todos los otros/i.test(t)) {
         return 'medidas'
+      }
+      const lastBotMsg = [...history].reverse().find(m => m.sender === 'ai')
+      if (lastBotMsg && (lastBotMsg.agent_type === 'medidas' || /PLANILLA DE MEDIDAS/i.test(lastBotMsg.content || ''))) {
+        if (!/reforma|remodelar|impermeabiliz|gotera|humedad|pintura|albañil|mueble|sillón|cocina|escalera/.test(t)) {
+          return 'medidas'
+        }
       }
     }
   }
@@ -548,13 +554,18 @@ TU RESPUESTA NO DEBE SUPERAR BAJO NINGÚN CONCEPTO LAS 3 LÍNEAS DE TEXTO. No ha
     let isPlanillaHandoff = false
     let planillaSummary = null
     if (agentType === 'medidas') {
-      const confirmsPlanilla = (/wa\.me\/|registrad|envié|deriv|producción/i.test(reply) && /(asesor|planilla)/i.test(reply)) ||
-        (/PLANILLA DE MEDIDAS/i.test(history.map(m => m.content || '').join(' ')) && /^(s[ií]|correcto|est[aá] bien|perfecto|confirmado|dale|avanz[aá]|mandalo|pasalo)$/i.test((text || '').trim()))
+      const isAskingConfirmation = /¿Está todo correcto|querés modificar|algún dato/i.test(reply)
+      const hasPlanillaInHistory = /PLANILLA DE MEDIDAS/i.test(history.map(m => m.content || '').join(' ')) || /PLANILLA DE MEDIDAS/i.test(reply)
+      const clientConfirmed = hasPlanillaInHistory &&
+        /(s[ií]|correcto|est[aá] (todo )?bien|est[aá]n bien|todos los otros datos estan bien|perfecto|confirmad[oa]|dale|avanz[aá]|mandalo|pasalo|todo listo|coordinemos( una visita)?|genial|ok|joya|de diez)/i.test((text || '').trim())
+      const botConfirmed = !isAskingConfirmation && /(ya quedó registrada|se la envié a nuestro asesor|quedó confirmada|preparamos tu cotización)/i.test(reply)
+
+      const confirmsPlanilla = !isAskingConfirmation && (clientConfirmed || botConfirmed)
 
       if (confirmsPlanilla) {
         isPlanillaHandoff = true
         const allText = [...history.map(m => m.content || ''), reply].join('\n\n')
-        const match = allText.match(/📋[\s\S]*?(?=¿Está todo correcto|¡Excelente|https:\/\/wa\.me|$)/i)
+        const match = allText.match(/📋[\s\S]*?(?=¿Está todo correcto|¡Excelente|https:\/\/wa\.me|Todo listo|$)/i)
         planillaSummary = match ? match[0].trim() : reply
       }
     }

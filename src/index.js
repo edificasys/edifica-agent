@@ -10,6 +10,7 @@ import Groq from 'groq-sdk'
 import { put } from '@vercel/blob'
 import { db } from './db.js'
 import { getAIReply, getAdvisorInfo, createGroqChat } from './ai.js'
+import { parsePlanillaText, generatePlanillaPDF } from './pdfPlanilla.js'
 import { sendAdminAlert, setAdminSocket } from './alerts.js'
 
 dotenv.config()
@@ -313,55 +314,117 @@ async function connectToWhatsApp() {
           await createAndPushNotif('conv_active', 'Conversación activa', `${msg.pushName || identifier}: "${(text || saved).substring(0, 60)}"`, { convId: contact.conversation_id, phone: identifier, name: msg.pushName || '' })
         }
 
-        // Derivación especial: Planilla de Medidas confirmada
+        // Derivación especial: Planilla de Medidas confirmada (genera PDF y rota asesor)
         if (isPlanillaHandoff && summary) {
           const clientName = msg.pushName || identifier
+
+          // 1. Asignar asesor rotado (Round-Robin estricto para no mandar a todos ni repetir)
+          const chosenAdvisor = await db.getNextRotatedAdvisor(settings, 'medidas')
+          const advisorPhone = chosenAdvisor.phone || REDIRECT
+
+          // 2. Generar el PDF oficial con el diseño exacto de EDIFICA EQUIPAMIENTOS
+          let pdfBuffer = null
+          let parsedData = null
+          try {
+            parsedData = parsePlanillaText(summary, clientName)
+            pdfBuffer = await generatePlanillaPDF(parsedData)
+            console.log(`[PLANILLA] PDF generado exitosamente (${pdfBuffer.length} bytes) para ${parsedData.obra || clientName}`)
+          } catch (pdfErr) {
+            console.error('[PLANILLA] Error generando PDF:', pdfErr.message)
+          }
+
           const planillaAdvisorMsg =
             `📐 *NUEVA PLANILLA DE MEDIDAS DE OBRA*\n\n` +
             `👤 *Cliente:* ${clientName}\n` +
-            `📱 *WhatsApp:* wa.me/+${identifier}\n\n` +
+            `📱 *WhatsApp:* wa.me/+${identifier}\n` +
+            `📍 *Dirección:* ${parsedData?.direccion || 'A confirmar'}\n` +
+            `👷 *Asesor asignado:* ${chosenAdvisor.name}\n\n` +
             `${summary}\n\n` +
+            `📎 *Adjunto el documento PDF oficial con el relevamiento técnico.*\n\n` +
             `⏰ ${new Date().toLocaleString('es-AR', { timeZone: 'America/Argentina/Buenos_Aires' })}`
+
+          // 3. Enviar PDF y datos exclusivamente AL ASESOR ASIGNADO (SOLO A UNO)
           try {
-            const targetAdvisorPhone = result.handoff_target || REDIRECT
-            const validPhone = String(targetAdvisorPhone).replace(/[^0-9]/g, '') || REDIRECT
-            await sock.sendMessage(`${validPhone}@s.whatsapp.net`, { text: planillaAdvisorMsg })
-            console.log(`[PLANILLA] Planilla enviada al asesor ${validPhone}`)
+            if (advisorPhone) {
+              const cleanAdvisorPhone = String(advisorPhone).replace(/[^0-9]/g, '')
+              await sock.sendMessage(`${cleanAdvisorPhone}@s.whatsapp.net`, { text: planillaAdvisorMsg })
+              if (pdfBuffer) {
+                await sock.sendMessage(`${cleanAdvisorPhone}@s.whatsapp.net`, {
+                  document: pdfBuffer,
+                  mimetype: 'application/pdf',
+                  fileName: `Planilla_Medidas_${(parsedData?.obra || clientName).replace(/[^a-zA-Z0-9]/g, '_')}.pdf`,
+                  caption: `📄 Planilla oficial de relevamiento - Obra ${parsedData?.obra || clientName}`
+                })
+              }
+              console.log(`[PLANILLA] Planilla y PDF enviados exclusivamente al asesor rotado ${cleanAdvisorPhone} (${chosenAdvisor.name})`)
+            }
           } catch (e) {
             console.error('[PLANILLA] Error enviando planilla al asesor:', e.message)
           }
+
+          // 4. Enviar PDF también AL CLIENTE para su constancia
+          try {
+            if (pdfBuffer) {
+              await sock.sendMessage(msg.key.remoteJid, {
+                document: pdfBuffer,
+                mimetype: 'application/pdf',
+                fileName: `Planilla_Medidas_${(parsedData?.obra || clientName).replace(/[^a-zA-Z0-9]/g, '_')}.pdf`,
+                caption: `📄 ¡Acá tenés la Planilla de Medidas oficial en PDF de tu obra! Ya se la envié a nuestro asesor técnico para preparar la cotización y coordinar producción. 🙌`
+              })
+              console.log(`[PLANILLA] PDF enviado al cliente ${identifier}`)
+            }
+          } catch (e) {
+            console.error('[PLANILLA] Error enviando PDF al cliente:', e.message)
+          }
+
+          // 5. Guardar en Base de Datos con su PDF en Base64
           await db.savePlanillaMedidas({
             conv_id: contact.conversation_id,
             contact_id: contact.id,
-            obra: clientName,
+            obra: parsedData?.obra || clientName,
+            direccion: parsedData?.direccion || null,
+            relevo: parsedData?.relevo || clientName,
+            vanos: parsedData?.vanos || [],
+            observaciones: parsedData?.observaciones || null,
             formatted_text: summary,
+            pdf_base64: pdfBuffer ? pdfBuffer.toString('base64') : null,
             status: 'confirmada'
           }).catch(err => console.error('[DB Planilla Error]:', err.message))
 
-          await createAndPushNotif('planilla_medidas', 'Planilla de Medidas confirmada', `${clientName} completó la planilla de relevamiento para producción`, { convId: contact.conversation_id, phone: identifier, name: clientName, summary, waLink: `https://wa.me/${identifier}` })
+          await createAndPushNotif('planilla_medidas', 'Planilla de Medidas confirmada', `${clientName} completó la planilla de relevamiento (Asesor: ${chosenAdvisor.name})`, {
+            convId: contact.conversation_id,
+            phone: identifier,
+            name: clientName,
+            summary,
+            advisor: chosenAdvisor.name,
+            waLink: `https://wa.me/${identifier}`
+          })
         } else if (isHandoff && summary) {
-          // Derivación general a asesor
+          // Derivación general a asesor (asignación equitativa Round-Robin a un solo asesor)
           const clientName = msg.pushName || identifier
+          const chosenAdvisor = await db.getNextRotatedAdvisor(settings)
+          const advisorPhone = chosenAdvisor.phone || REDIRECT
           const imgLine = imageDescription ? `\n🖼️ *Imagen enviada por el cliente:* ${imageDescription}\n` : ''
           const adminMsg =
             `🔔 *Cliente derivado a asesor*\n\n` +
             `👤 *Cliente:* ${clientName}\n` +
-            `📱 *Número:* wa.me/+${identifier}\n\n` +
+            `📱 *Número:* wa.me/+${identifier}\n` +
+            `👷 *Asesor asignado:* ${chosenAdvisor.name}\n\n` +
             `📋 *Resumen de la consulta:*\n${summary}${imgLine}\n` +
             `⏰ ${new Date().toLocaleString('es-AR', { timeZone: 'America/Argentina/Buenos_Aires' })}`
           try {
-            const targetAdvisorPhone = result.handoff_target || REDIRECT
-            const validPhone = String(targetAdvisorPhone).replace(/[^0-9]/g, '') || REDIRECT
-            await sock.sendMessage(`${validPhone}@s.whatsapp.net`, { text: adminMsg })
-            // Si el cliente mandó imagen, reenviarla al asesor también
-            if (imageBuffer && imageDescription) {
-              await sock.sendMessage(`${validPhone}@s.whatsapp.net`, { image: imageBuffer, caption: `📎 Imagen enviada por ${clientName}` })
+            if (advisorPhone) {
+              const validPhone = String(advisorPhone).replace(/[^0-9]/g, '')
+              await sock.sendMessage(`${validPhone}@s.whatsapp.net`, { text: adminMsg })
+              if (imageBuffer && imageDescription) {
+                await sock.sendMessage(`${validPhone}@s.whatsapp.net`, { image: imageBuffer, caption: `📎 Imagen enviada por ${clientName}` })
+              }
+              console.log(`[REDIR] Resumen enviado exclusivamente al asesor rotado ${validPhone} (${chosenAdvisor.name})`)
             }
-            console.log(`[REDIR] Resumen enviado al asesor ${validPhone}`)
           } catch (e) {
             console.error('[REDIR] Error enviando resumen al asesor:', e.message)
           }
-          await createAndPushNotif('handoff', 'Derivación a asesor', `${clientName} fue derivado al asesor`, { convId: contact.conversation_id, phone: identifier, name: clientName, summary, waLink: `https://wa.me/${identifier}` })
+          await createAndPushNotif('handoff', 'Derivación a asesor', `${clientName} fue derivado al asesor ${chosenAdvisor.name}`, { convId: contact.conversation_id, phone: identifier, name: clientName, summary, advisor: chosenAdvisor.name, waLink: `https://wa.me/${identifier}` })
         }
 
         messageCount++
@@ -397,8 +460,32 @@ async function createAndPushNotif(type, title, body, data = {}) {
 cron.schedule('*/5 * * * *', async () => {
   if (!activeSock || connectionStatus !== 'connected') return
   try {
+    const settings = await db.getAISettings().catch(() => null)
+    // Desactivado por defecto. Solo actúa si el usuario activó explícitamente recontact_enabled
+    if (!settings?.recontact_enabled) return
+
     const convs = await db.getConversationsForRecontact()
     for (const conv of convs) {
+      const targetPhone = String(conv.phone || '').trim()
+      // Filtros de protección: no recontactar grupos, broadcasts ni canales
+      if (!targetPhone ||
+          targetPhone.includes('broadcast') ||
+          targetPhone.includes('@g.us') ||
+          targetPhone.includes('newsletter') ||
+          targetPhone === 'status') {
+        await db.setRecontactSent(conv.conversation_id)
+        continue
+      }
+
+      // Si hay whitelist activa, no recontactar números fuera de whitelist
+      const ALLOWED = (settings?.allowed_phones?.length)
+        ? settings.allowed_phones
+        : (process.env.ALLOWED_PHONES || '').split(',').map(p => p.trim()).filter(Boolean)
+      if (ALLOWED.length > 0 && !ALLOWED.includes(targetPhone)) {
+        await db.setRecontactSent(conv.conversation_id)
+        continue
+      }
+
       const history = await db.getRecentMessages(conv.conversation_id, 10)
       const result  = await getAIReply({ text: '', hasImage: false, imageBuffer: null, hasAudio: false, audioBuffer: null, history, clientName: conv.name || conv.phone, agentTypeOverride: 'recontacto' })
       if (result.reply && !result.isError) {
@@ -877,6 +964,35 @@ Respondé en español rioplatense, mensajes cortos y claros. Sé amigable pero d
       const convId = parseInt(convPauseMatch[1])
       await db.setBotPaused(convId, !!paused)
       return json(res, { ok: true })
+    } catch (err) { return json(res, { error: err.message }, 500) }
+  }
+
+  // DELETE /api/conversations/:id (Eliminar conversación)
+  const convDeleteMatch = url.match(/^\/api\/conversations\/(\d+)$/)
+  if (convDeleteMatch && req.method === 'DELETE') {
+    try {
+      const convId = parseInt(convDeleteMatch[1])
+      await db.deleteConversation(convId)
+      await db.logActivity(authUser.id, authUser.username, 'eliminar_conversacion', { convId })
+      return json(res, { ok: true, deleted: convId })
+    } catch (err) { return json(res, { error: err.message }, 500) }
+  }
+
+  // GET /api/planillas/:id/pdf (Descargar PDF oficial de planilla de medidas)
+  const planillaPdfMatch = url.match(/^\/api\/planillas\/(\d+)\/pdf$/)
+  if (planillaPdfMatch && req.method === 'GET') {
+    try {
+      const id = parseInt(planillaPdfMatch[1])
+      const planilla = await db.getPlanillaById(id).catch(() => null)
+      if (!planilla || !planilla.pdf_base64) return json(res, { error: 'PDF no disponible' }, 404)
+      const pdfBuf = Buffer.from(planilla.pdf_base64, 'base64')
+      res.writeHead(200, {
+        'Content-Type': 'application/pdf',
+        'Content-Disposition': `inline; filename="Planilla_Medidas_${String(planilla.obra || id).replace(/[^a-zA-Z0-9]/g, '_')}.pdf"`,
+        'Content-Length': pdfBuf.length
+      })
+      res.end(pdfBuf)
+      return
     } catch (err) { return json(res, { error: err.message }, 500) }
   }
 
